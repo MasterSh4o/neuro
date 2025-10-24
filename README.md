@@ -1,72 +1,164 @@
 # Interferogram CNN — Yandex DataSphere (g2.1, 80GB VRAM)
 
-Universal PyTorch project for **300,000** grayscale interferograms of size **256×256** with optional **80-d side features** and multi-class classification.
-Optimized for **Yandex DataSphere** `g2.1` (A100 80GB) with mixed precision, gradient accumulation, cosine LR with warmup, channels-last, and `torch.compile` (optional).
+Universal PyTorch project for **300,000** grayscale interferograms of size **256×256** with multi-label classification.
+Optimized for **Yandex DataSphere** `g2.1` (A100 80GB) with mixed precision, advanced scheduling, enhanced architecture, and comprehensive logging.
 
 ## Highlights
-- Grayscale input (1×256×256), configurable classes.
-- Optional 80-d side vector per sample (fused via MLP).
-- Efficient residual CNN with Squeeze-and-Excitation.
-- AMP (`torch.cuda.amp`), channels-last, gradient accumulation.
-- Cosine LR with warmup, EMA, label smoothing, AdamW.
-- Robust DataLoader (prefetch, pin_memory, persistent_workers).
-- TensorBoard + CSV logging, graceful resume, checkpoints.
-- Config-driven (`configs/default.yaml`).
-
-## Expected data layout
-You can choose **any** of the following (declare in config):
-1. **Image folders**: `root/cls_x/*.png` or `root/cls_x/*.jpg` (grayscale).  
-2. **Numpy arrays**: `root/images/*.npy` (H×W or 1×H×W), labels in `labels.csv` with columns `path,label`.
-3. **Memmap/LMDB** (advanced): adapt `dataset.py` templates.
-
-Optional side-features (80-d): provide `side_features.csv` with columns `path,f0,...,f79`.
-Paths in CSV should match relative paths used by the dataset.
+- Grayscale input (1×256×256), configurable multi-label classes.
+- **Enhanced architecture**: 3‑layer MLP head with configurable hidden dimensions, dropout, and normalization.
+- **Advanced scheduling**: Cosine warmup OR WarmupReduceLROnPlateau for adaptive learning rates.
+- **Label smoothing**: Configurable BCE with logits smoothing for better generalization.
+- **Gradient clipping**: Robust training with non‑finite gradient detection and skipping.
+- AMP (`torch.cuda.amp`), channels‑last, gradient accumulation.
+- EMA, AdamW, comprehensive logging (TensorBoard + JSON).
+- **Environment‑aware**: Dedicated DataSphere configuration with workspace paths.
+- Config‑driven (`configs/default.yaml`, `configs/datasphere.yaml`).
 
 ## Quick start (DataSphere, single GPU g2.1 80GB)
+
+### Method 1: Using the DataSphere launcher
 ```bash
-# 1) In a terminal cell
+# 1) Install dependencies
+bash scripts/setup_env.sh
+
+# 2) Run with DataSphere config (automatically sets paths)
+bash scripts/run_datasphere.sh --config configs/datasphere.yaml
+
+# 3) Resume from checkpoint
+bash scripts/run_datasphere.sh --config configs/datasphere.yaml --resume runs/best.pt
+```
+
+### Method 2: Manual execution
+```bash
+# 1) Install dependencies
 pip install -r requirements.txt
 
-# 2) Edit config
-cp configs/default.yaml configs/local.yaml
-# set data.root, data.format, data.num_classes, etc.
-
-# 3) Train
+# 2) Train with local config
 python -u src/train.py --config configs/local.yaml
 
+# 3) Train with DataSphere config
+python -u src/train.py --config configs/datasphere.yaml
+
 # 4) Resume
-python -u src/train.py --config configs/local.yaml --resume path/to/checkpoint.pt
+python -u src/train.py --config configs/datasphere.yaml --resume runs/best.pt
 
 # 5) TensorBoard
 tensorboard --logdir runs
 ```
 
-## Object Storage (optional)
-If your data is in Yandex Object Storage (S3-compatible), mount or download locally in a notebook cell.
-You can pass absolute paths into `configs/local.yaml` after mounting.
+## Configuration options
 
-## Notes for 300k samples
-- Start with `batch_size: 256` on A100 80GB; increase if memory allows.
-- Use `precision: "amp"` and `channels_last: true`.
-- Enable `grad_accum_steps` for larger effective batch sizes if needed.
-- Keep `num_workers` ≤ CPU cores; `persistent_workers: true` for speed.
+### Model architecture (new parameters)
+```yaml
+model:
+  hidden_dims: [1024, 512, 256]    # MLP head hidden layers
+  head_dropout: 0.3                # Dropout between head layers
+  head_norm: "layernorm"           # Normalization: layernorm/batchnorm1d/none
+```
+
+### Training enhancements
+```yaml
+train:
+  current_epoch: 51                # Resume from epoch (progress tracking)
+  label_smoothing: 0.05            # BCE smoothing ε
+  loss_reduction: "mean"           # Loss reduction mode
+  scheduler:
+    name: "warmup_plateau"         # New adaptive scheduler
+    warmup_epochs: 3
+    factor: 0.5
+    patience: 2
+    mode: "max"
+    metric: "f1_micro"
+```
+
+### DataSphere‑specific settings
+```yaml
+workspace_root: "/home/jupyter/work"  # DataSphere workspace
+data:
+  root: "/home/jupyter/work/datasets/InterfDataset"
+logging:
+  out_dir: "runs"                     # Relative to workspace_root
+```
+
+## Expected data layout
+
+The system expects bit‑encoded labels in filenames with configurable regex:
+```
+/path/to/data/1_5_12_0_8.png
+# → Extract numbers [1,5,12,0,8] → Convert to binary vector
+```
+
+Configuration options:
+```yaml
+data:
+  label_parsing:
+    filename_label_regex: "(\d{1,2})"
+    numbers_total: 11
+    bits_per_number: 5
+    ignore_last_number: true
+    value_mode: "mod"        # mod/clip/raise
+```
+
+## Advanced features
+
+### WarmupReduceLROnPlateau scheduler
+Combines linear warmup with ReduceLROnPlateau for adaptive LR scheduling:
+```yaml
+train:
+  scheduler:
+    name: "warmup_plateau"
+    warmup_epochs: 3
+    factor: 0.5
+    patience: 2
+    cooldown: 1
+    min_lr: 1.0e-6
+    metric: "f1_micro"
+```
+
+### Label smoothing
+Reduces overconfidence in multi‑label classification:
+```yaml
+train:
+  label_smoothing: 0.05  # ε ∈ [0,1]
+```
+
+### Gradient clipping with logging
+Automatic detection and skipping of non‑finite gradients with detailed logging:
+```yaml
+train:
+  max_grad_norm: 1.0
+```
 
 ## Project tree
 ```
 configs/
-  default.yaml
+  default.yaml          # Base configuration
+  local.yaml            # Local development settings
+  datasphere.yaml       # DataSphere g2.1 optimized settings
+docs/
+  datasphere_plan.md    # Implementation plan and tracking
 scripts/
-  run_datasphere.sh
+  run_datasphere.sh     # DataSphere launcher with environment setup
+  setup_env.sh          # Dependency installation
 src/
-  train.py
-  data/dataset.py
-  models/net.py
-  utils/scheduler.py
-  utils/metrics.py
-  utils/common.py
+  train.py              # Main training script with enhanced features
+  data/dataset.py       # Bit‑encoded label parsing
+  models/net.py         # Enhanced CNN with configurable MLP head
+  utils/
+    scheduler.py        # CosineWarmupLR + WarmupReduceLROnPlateau
+    metrics.py          # Multi‑label metrics
+    common.py           # Utilities
 requirements.txt
 ```
 
+## Training progress tracking
+
+The system automatically tracks and resumes training progress:
+- `current_epoch` in configuration specifies starting epoch
+- Checkpoints include full state (model, optimizer, scheduler, scaler, EMA)
+- Both `CosineWarmupLR` and `WarmupReduceLROnPlateau` are serializable
+- Progress is logged to TensorBoard and JSON history files
+
 ---
 
-**Authoring notes:** this template incorporates issues discussed in prior chats: warmup scheduler, grayscale inputs, optional 80-d extras, F1 micro/macro, large-batch stability, and robust logging/resume.
+**Updated for DataSphere g2.1** with enhanced architecture, adaptive scheduling, label smoothing, and comprehensive progress tracking.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,17 @@ def _make_norm(norm_type: str, num_channels: int, gn_groups: int) -> nn.Module:
             groups -= 1
         return nn.GroupNorm(groups, num_channels)
     raise ValueError(f"Unsupported norm type: {norm_type}")
+
+
+def _make_head_norm(norm_type: str, dim: int) -> nn.Module:
+    kind = norm_type.lower()
+    if kind in {"layernorm", "ln"}:
+        return nn.LayerNorm(dim)
+    if kind in {"batchnorm1d", "batchnorm", "bn"}:
+        return nn.BatchNorm1d(dim)
+    if kind in {"none", "", "identity"}:
+        return nn.Identity()
+    raise ValueError(f"Unsupported head norm type: {norm_type}")
 
 
 @dataclass
@@ -111,6 +122,9 @@ class InterferoNetMultiLabel(nn.Module):
         gn_groups: int = 16,
         stochastic_depth: float = 0.0,
         dropout: float = 0.2,
+        hidden_dims: Optional[Sequence[int]] = None,
+        head_dropout: float = 0.3,
+        head_norm: str = "layernorm",
     ):
         super().__init__()
         width_multipliers = tuple(width_multipliers)
@@ -150,22 +164,35 @@ class InterferoNetMultiLabel(nn.Module):
                 in_c = out_c
                 block_idx += 1
         self.backbone = nn.Sequential(*blocks)
-        self.head_norm = _make_norm(norm_type, in_c, gn_groups)
-        self.head_act = nn.ReLU(inplace=True)
+        self.head_norm2d = _make_norm(norm_type, in_c, gn_groups)
+        self.head_act2d = nn.ReLU(inplace=True)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Sequential(
-            nn.Linear(in_c, in_c),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout, inplace=False),
-            nn.Linear(in_c, out_dim),
-        )
+
+        mlp_layers: List[nn.Module] = []
+        hidden_dims_tuple = tuple(hidden_dims) if hidden_dims is not None else (in_c // 2, in_c // 4, in_c // 8)
+        if len(hidden_dims_tuple) == 0:
+            hidden_dims_tuple = (in_c,)
+        prev_dim = in_c
+        head_norm_type = head_norm.lower() if head_norm is not None else "none"
+        head_dropout = float(head_dropout)
+        for dim in hidden_dims_tuple:
+            mlp_layers.append(nn.Linear(prev_dim, dim))
+            if head_norm_type not in {"none", ""}:
+                mlp_layers.append(_make_head_norm(head_norm_type, dim))
+            mlp_layers.append(nn.ReLU(inplace=True))
+            if head_dropout > 0:
+                mlp_layers.append(nn.Dropout(p=head_dropout))
+            prev_dim = dim
+        self.head = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
+        self.classifier = nn.Linear(prev_dim, out_dim)
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
         self._init_weights()
 
     def _init_weights(self) -> None:
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.BatchNorm1d, nn.LayerNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
@@ -177,7 +204,9 @@ class InterferoNetMultiLabel(nn.Module):
         x = self.stem(x)
         x = self.pool(x)
         x = self.backbone(x)
-        x = self.head_act(self.head_norm(x))
+        x = self.head_act2d(self.head_norm2d(x))
         x = self.global_pool(x).flatten(1)
+        x = self.head(x)
+        x = self.dropout(x)
         x = self.classifier(x)
         return x

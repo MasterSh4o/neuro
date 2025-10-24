@@ -8,7 +8,7 @@ import hashlib
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover
 
 from utils.common import set_seed, load_config, human_int
 from utils.metrics import MultilabelMetrics
-from utils.scheduler import CosineWarmupLR
+from utils.scheduler import CosineWarmupLR, WarmupReduceLROnPlateau, WarmupReduceLROnPlateauConfig
 from data.dataset import InterferogramDataset
 from models.net import InterferoNetMultiLabel
 
@@ -55,6 +55,26 @@ def collate_fn(batch):
     y = _T.stack(ys, dim=0).float()
     side = None
     return x, y, side, list(rels)
+
+
+class BCEWithLogitsLossWithSmoothing(nn.Module):
+    def __init__(self, smoothing: float = 0.0, reduction: str = "mean"):
+        super().__init__()
+        self.smoothing = float(smoothing)
+        self.reduction = reduction
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if self.smoothing <= 0.0:
+            return nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction=self.reduction)
+        targets_smooth = targets * (1.0 - self.smoothing) + self.smoothing
+        loss = self.bce(logits, targets_smooth)
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
 
 
 def ensure_dir(path: str) -> None:
@@ -425,7 +445,7 @@ def save_checkpoint(
     epoch: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: CosineWarmupLR,
+    scheduler: Union[CosineWarmupLR, WarmupReduceLROnPlateau],
     scaler: _GradScaler,
     ema: EMA,
     best_micro: float,
@@ -617,6 +637,9 @@ def main():
         gn_groups=int(model_cfg.get("gn_groups", 16)),
         stochastic_depth=float(model_cfg.get("stochastic_depth", 0.0)),
         dropout=float(model_cfg.get("dropout", 0.2)),
+        hidden_dims=model_cfg.get("hidden_dims", None),
+        head_dropout=float(model_cfg.get("head_dropout", 0.3)),
+        head_norm=model_cfg.get("head_norm", "layernorm"),
     )
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -635,12 +658,30 @@ def main():
         betas=tuple(train_cfg.get("betas", (0.9, 0.999))),
     )
     scheduler_cfg = train_cfg.get("scheduler", {})
-    scheduler = CosineWarmupLR(
-        optimizer,
-        T_max=int(train_cfg.get("epochs", 1)),
-        warmup_epochs=int(scheduler_cfg.get("warmup_epochs", 5)),
-        min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
-    )
+    scheduler_name = scheduler_cfg.get("name", "cosine_warmup")
+    if scheduler_name == "warmup_plateau":
+        scheduler = WarmupReduceLROnPlateau(
+            optimizer,
+            config=WarmupReduceLROnPlateauConfig(
+                warmup_epochs=int(scheduler_cfg.get("warmup_epochs", 3)),
+                factor=float(scheduler_cfg.get("factor", 0.5)),
+                patience=int(scheduler_cfg.get("patience", 2)),
+                cooldown=int(scheduler_cfg.get("cooldown", 1)),
+                min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
+                threshold=float(scheduler_cfg.get("threshold", 1e-4)),
+                threshold_mode=scheduler_cfg.get("threshold_mode", "rel"),
+                mode=scheduler_cfg.get("mode", "max"),
+                metric=scheduler_cfg.get("metric", "f1_micro"),
+            ),
+            base_lrs=[train_cfg["lr"]],
+        )
+    else:
+        scheduler = CosineWarmupLR(
+            optimizer,
+            T_max=int(train_cfg.get("epochs", 1)),
+            warmup_epochs=int(scheduler_cfg.get("warmup_epochs", 5)),
+            min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
+        )
     scaler = make_scaler(device_type, use_amp)
     ema = EMA(model, decay=float(train_cfg.get("ema_decay", 0.999)))
 
@@ -661,12 +702,23 @@ def main():
             raise ValueError(f"Unsupported bce_pos_weight value: {bce_pos_value}")
     elif bce_pos_value is not None:
         pos_weight_tensor = torch.tensor(bce_pos_value, dtype=torch.float32, device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    label_smoothing = float(train_cfg.get("label_smoothing", 0.0))
+    loss_reduction = train_cfg.get("loss_reduction", "mean")
+    if label_smoothing > 0:
+        criterion = BCEWithLogitsLossWithSmoothing(
+            smoothing=label_smoothing,
+            reduction=loss_reduction,
+        )
+        print(f"[INFO] Using BCE with label smoothing ε={label_smoothing}")
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction=loss_reduction)
 
     logging_cfg = cfg.get("logging", {})
+    workspace_root = Path(cfg.get("workspace_root", "/home/jupyter/work")).expanduser()
     base_out_dir = Path(logging_cfg.get("out_dir", "runs")).expanduser()
     if not base_out_dir.is_absolute():
-        base_out_dir = (Path.cwd() / base_out_dir).resolve()
+        base_out_dir = workspace_root / base_out_dir
+    base_out_dir = base_out_dir.resolve()
     project_name = logging_cfg.get("project_name", "experiment")
     run_name = logging_cfg.get("run_name") or datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = base_out_dir / project_name / run_name
@@ -696,13 +748,14 @@ def main():
     history: list[Dict[str, Any]] = []
     global_step = 0
     epochs = int(train_cfg.get("epochs", 1))
+    current_epoch = int(train_cfg.get("current_epoch", 0))
     grad_accum = int(train_cfg.get("grad_accum_steps", 1))
     max_grad_norm = float(train_cfg.get("max_grad_norm", 0.0))
     best_micro = 0.0
     best_epoch = 0
     best_checkpoint_path: Optional[Path] = None
     patience_counter = 0
-    start_epoch = 0
+    start_epoch = current_epoch
 
     if args.resume:
         resume_path = Path(args.resume)
@@ -731,6 +784,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         epoch_loss = 0.0
         num_batches = 0
+        skipped_steps = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", ncols=120)
         for step, (x, y, _, _) in enumerate(pbar):
             x = x.to(device, non_blocking=True)
@@ -746,7 +800,8 @@ def main():
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     if not math.isfinite(float(grad_norm)):
-                        print(f"[WARN] Non-finite gradient norm {grad_norm}. Skipping optimizer step.")
+                        print(f"[WARN] Non-finite gradient norm {grad_norm:.4f}. Skipping optimizer step.")
+                        skipped_steps += 1
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
                         continue
@@ -760,11 +815,16 @@ def main():
             if writer and log_every > 0 and global_step % log_every == 0:
                 writer.add_scalar("train/loss_iter", epoch_loss / num_batches, global_step)
             pbar.set_postfix({"loss": f"{epoch_loss / max(1, num_batches):.4f}"})
-        scheduler.step()
+        
         train_loss = epoch_loss / max(1, num_batches)
+        if skipped_steps > 0:
+            print(f"[INFO] Skipped {skipped_steps} optimizer steps due to non-finite gradients.")
+        
         if writer:
             writer.add_scalar("train/loss_epoch", train_loss, epoch + 1)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch + 1)
+            if skipped_steps > 0:
+                writer.add_scalar("train/skipped_steps", skipped_steps, epoch + 1)
 
         with ema.average_parameters(model):
             val_metrics = evaluate(model, val_loader, criterion, device, device_type, use_amp, threshold, channels_last)
@@ -776,6 +836,12 @@ def main():
             writer.add_scalar("val/f1_macro", val_metrics.get("f1_macro", 0.0), epoch + 1)
             if "f1_weighted" in val_metrics:
                 writer.add_scalar("val/f1_weighted", val_metrics["f1_weighted"], epoch + 1)
+
+        if isinstance(scheduler, WarmupReduceLROnPlateau):
+            metric_value = val_metrics.get(scheduler.cfg.metric, val_metrics.get("f1_micro", 0.0))
+            scheduler.step(metric_value)
+        else:
+            scheduler.step()
 
         history_entry = {
             "epoch": epoch + 1,

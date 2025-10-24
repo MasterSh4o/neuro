@@ -1,9 +1,10 @@
-# configs/local.yaml — v8 (локальные пути)
+# configs/datasphere.yaml — g2.1 профиль
 seed: 42
 device: cuda
 precision: amp
 channels_last: true
 torch_compile: true
+workspace_root: "/home/jupyter/work"
 
 model:
   base_channels: 32
@@ -11,19 +12,19 @@ model:
   block_repeats: [1, 1, 1, 1]
   norm: groupnorm
   gn_groups: 16
-  stochastic_depth: 0.1
-  dropout: 0.2
-  hidden_dims: [768, 384, 192]
-  head_dropout: 0.25
+  stochastic_depth: 0.2
+  dropout: 0.15
+  hidden_dims: [1024, 512, 256]
+  head_dropout: 0.3
   head_norm: layernorm
 
 data:
-  root: "../datasets/InterfDataset"
+  root: "/home/jupyter/work/datasets/InterfDataset"
   img_glob: "**/*.png,**/*.jpg,**/*.tif,**/*.bmp"
   image_size: 256
 
   label_parsing:
-    filename_label_regex: "(\\d{1,2})"
+    filename_label_regex: "(\d{1,2})"
     numbers_total: 11
     ignore_last_number: true
     bits_per_number: 5
@@ -55,7 +56,7 @@ data:
       prob: 0.3
 
   loader:
-    workers: 16
+    workers: 24
     persistent_workers: true
     prefetch_factor: 4
     pin_memory: true
@@ -67,7 +68,7 @@ split:
   val_ratio: 0.2
   test_ratio: 0.2
   stratified: true
-  max_val_samples: 5000
+  max_val_samples: 4000
   cache_dir: "runs/splits"
   reuse_cached: true
 
@@ -76,22 +77,29 @@ train:
   current_epoch: 51
   batch_size: 256
   grad_accum_steps: 1
-  lr: 0.0007
+  lr: 0.00065
   weight_decay: 0.05
   betas: [0.9, 0.999]
   ema_decay: 0.999
   max_grad_norm: 1.0
-  early_stopping_patience: 10
-  log_every_n_steps: 50
+  early_stopping_patience: 8
+  log_every_n_steps: 25
   tensorboard:
     enabled: true
     log_dir: "runs/tensorboard"
   scheduler:
-    name: "cosine_warmup"
-    warmup_epochs: 5
+    name: "warmup_plateau"
+    warmup_epochs: 3
+    factor: 0.5
+    patience: 2
+    cooldown: 1
     min_lr: 1.0e-6
+    threshold: 1.0e-4
+    threshold_mode: "rel"
+    mode: "max"
+    metric: "f1_micro"
   bce_pos_weight: auto
-  label_smoothing: 0.0
+  label_smoothing: 0.05
   loss_reduction: "mean"
 
 eval:
@@ -99,14 +107,12 @@ eval:
   batch_size: 256
   metrics_output: "runs/metrics"
 
-testing:
-  smoke_samples: 64
-
 logging:
   out_dir: "runs"
-  project_name: "interferogram_cnn"
+  project_name: "interferogram_cnn_datasphere"
+  run_name: null
   save_every: 1
-  keep_last_k: 5
+  keep_last_k: 8
   dump_config: true
   env_report: true
 
@@ -114,4 +120,4 @@ checkpoint:
   path: null
 
 testing:
-  smoke_samples: 32
+  smoke_samples: 96
