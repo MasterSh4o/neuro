@@ -238,23 +238,78 @@ class InterferogramDataset(Dataset):
 
         out = img
         rng = np.random.rand
+        
+        # Горизонтальное отражение
         enabled, prob = self._should_apply("hflip", 0.5)
         if enabled and rng() < prob:
             out = np.flip(out, axis=1)
 
+        # Вертикальное отражение
         enabled, prob = self._should_apply("vflip", 0.5)
         if enabled and rng() < prob:
             out = np.flip(out, axis=0)
 
+        # Поворот на 90 градусов
         enabled, prob = self._should_apply("rotate90", 0.5)
         if enabled and rng() < prob:
             out = np.rot90(out).copy()
 
+        # Случайный поворот
+        rot_cfg = self.aug_cfg.get("random_rotation", {})
+        if rot_cfg.get("enabled", False) and rng() < float(rot_cfg.get("prob", 0.3)):
+            degrees = float(rot_cfg.get("degrees", 15))
+            angle = np.random.uniform(-degrees, degrees)
+            h, w = out.shape
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            out = cv2.warpAffine(out, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+
+        # Случайное кадрирование (zoom)
+        crop_cfg = self.aug_cfg.get("random_crop", {})
+        if crop_cfg.get("enabled", False) and rng() < float(crop_cfg.get("prob", 0.3)):
+            scale_range = crop_cfg.get("scale", [0.9, 1.0])
+            scale = np.random.uniform(scale_range[0], scale_range[1])
+            h, w = out.shape
+            new_h, new_w = int(h * scale), int(w * scale)
+            if new_h > 0 and new_w > 0:
+                # Кадрируем центр изображения
+                start_h = (h - new_h) // 2
+                start_w = (w - new_w) // 2
+                cropped = out[start_h:start_h + new_h, start_w:start_w + new_w]
+                # Масштабируем обратно к исходному размеру
+                out = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # Цветовые искажения (яркость и контраст)
+        jitter_cfg = self.aug_cfg.get("color_jitter", {})
+        if jitter_cfg.get("enabled", False) and rng() < float(jitter_cfg.get("prob", 0.2)):
+            brightness = float(jitter_cfg.get("brightness", 0.1))
+            contrast = float(jitter_cfg.get("contrast", 0.1))
+            
+            # Яркость
+            if brightness > 0:
+                brightness_factor = 1.0 + np.random.uniform(-brightness, brightness)
+                out = out * brightness_factor
+            
+            # Контраст
+            if contrast > 0:
+                contrast_factor = 1.0 + np.random.uniform(-contrast, contrast)
+                mean = out.mean()
+                out = (out - mean) * contrast_factor + mean
+
+        # Гауссов шум
         gn_cfg = self.aug_cfg.get("gaussian_noise", {})
         if gn_cfg.get("enabled", False) and rng() < float(gn_cfg.get("prob", 0.2)):
             std = float(gn_cfg.get("std", 0.01))
             out = out + np.random.normal(0.0, std, size=out.shape).astype(np.float32)
 
+        # Гауссов размытие
+        blur_cfg = self.aug_cfg.get("gaussian_blur", {})
+        if blur_cfg.get("enabled", False) and rng() < float(blur_cfg.get("prob", 0.2)):
+            kernel_size = int(blur_cfg.get("kernel_size", 3))
+            if kernel_size > 0 and kernel_size % 2 == 1:  # Только нечетные размеры
+                out = cv2.GaussianBlur(out, (kernel_size, kernel_size), 0)
+
+        # Гамма коррекция
         gamma_cfg = self.aug_cfg.get("random_gamma", {})
         if gamma_cfg.get("enabled", False) and rng() < float(gamma_cfg.get("prob", 0.3)):
             lo, hi = gamma_cfg.get("range", [0.9, 1.1])
@@ -354,3 +409,53 @@ class InterferogramDataset(Dataset):
         y = torch.from_numpy(self.labels[idx]).float()
         side = None
         return x, y, side, rel_path
+        if idx_array.size == 0:
+            raise ValueError("Subset indices must be non-empty")
+
+        subset_files = [self.files[i] for i in idx_array]
+        subset_labels = self.labels[idx_array].copy()
+
+        normalization = deepcopy(self.normalization_cfg)
+        if share_stats and self.global_mean is not None:
+            normalization["mean"] = self.global_mean
+            normalization["std"] = self.global_std
+
+        subset = InterferogramDataset(
+            root=self.root,
+            img_glob=self.img_glob,
+            image_size=self.image_size,
+            numbers_total=self.numbers_total,
+            bits_per_number=self.bits_per_number,
+            value_mode=self.value_mode,
+            ignore_last_number=self.ignore_last_number,
+            augment=self.augment_flag if augment is None else bool(augment),
+            augmentations=deepcopy(self.aug_cfg),
+            normalization=normalization,
+            files=subset_files,
+            labels=subset_labels,
+        )
+        return subset
+
+    def __getitem__(self, idx: int):
+        rel_path = self.paths[idx]
+        full_path = os.path.join(self.root, rel_path)
+        img = self._read_image(full_path)
+
+        if self.norm_type == "per_image_zscore":
+            img = self._per_image_zscore(img)
+
+        img = self._augment(img)
+
+        if self.norm_type == "global_zscore" and self.global_mean is not None:
+            img = (img - self.global_mean) / (self.global_std + 1e-6)
+
+        if self.clip_range is not None:
+            lo, hi = self.clip_range
+            img = np.clip(img, lo, hi)
+
+        img = np.expand_dims(np.ascontiguousarray(img, dtype=np.float32), axis=0)
+        x = torch.from_numpy(img)
+        y = torch.from_numpy(self.labels[idx]).float()
+        side = None
+        return x, y, side, rel_path
+

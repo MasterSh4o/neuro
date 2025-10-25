@@ -57,6 +57,26 @@ def collate_fn(batch):
     return x, y, side, list(rels)
 
 
+def mixup_data(x, y, alpha=0.2):
+    """Реализация Mixup регуляризации"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Критерий для Mixup"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
 class BCEWithLogitsLossWithSmoothing(nn.Module):
     def __init__(self, smoothing: float = 0.0, reduction: str = "mean"):
         super().__init__()
@@ -517,6 +537,12 @@ def main():
     normalization_cfg = data_cfg.get("normalization", {})
     augment_cfg = data_cfg.get("augmentations", data_cfg.get("aug_cfg", {}))
     augment_enabled = bool(augment_cfg.get("enabled", True))
+    
+    # Mixup параметры
+    mixup_cfg = augment_cfg.get("mixup", {})
+    mixup_enabled = bool(mixup_cfg.get("enabled", False))
+    mixup_alpha = float(mixup_cfg.get("alpha", 0.2))
+    mixup_prob = float(mixup_cfg.get("prob", 0.2))
 
     full_ds = InterferogramDataset(
         root=root,
@@ -791,9 +817,18 @@ def main():
             y = y.to(device, non_blocking=True)
             if channels_last:
                 x = x.contiguous(memory_format=torch.channels_last)
+            
+            # Применяем Mixup с вероятностью mixup_prob
+            use_mixup = mixup_enabled and np.random.rand() < mixup_prob
+            if use_mixup:
+                x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha)
+            
             with autocast_ctx(device_type, use_amp):
                 logits = model(x)
-                loss = criterion(logits, y) / grad_accum
+                if use_mixup:
+                    loss = mixup_criterion(criterion, logits, y_a, y_b, lam) / grad_accum
+                else:
+                    loss = criterion(logits, y) / grad_accum
             scaler.scale(loss).backward()
             if (step + 1) % grad_accum == 0:
                 if max_grad_norm > 0:

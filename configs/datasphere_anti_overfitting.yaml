@@ -1,0 +1,149 @@
+# configs/datasphere_anti_overfitting.yaml — конфигурация с защитой от переобучения
+seed: 42
+device: cuda
+precision: amp
+channels_last: true
+torch_compile: false
+workspace_root: "/home/jupyter/work"
+
+model:
+  base_channels: 32
+  width_multipliers: [2, 4, 8, 12]
+  block_repeats: [1, 1, 1, 1]
+  norm: groupnorm
+  gn_groups: 16
+  stochastic_depth: 0.3  # Увеличили с 0.2 до 0.3
+  dropout: 0.25  # Увеличили с 0.15 до 0.25
+  hidden_dims: [1024, 512, 256]
+  head_dropout: 0.4  # Увеличили с 0.3 до 0.4
+  head_norm: layernorm
+
+data:
+  root: "/home/jupyter/work/datasets/InterfDataset"
+  img_glob: "**/*.png,**/*.jpg,**/*.tif,**/*.bmp"
+  image_size: 256
+
+  label_parsing:
+    filename_label_regex: "(\\d{1,2})"
+    numbers_total: 11
+    ignore_last_number: true
+    bits_per_number: 5
+    value_mode: "mod"
+
+  normalization:
+    type: "global_zscore"
+    stats_path: "runs/stats/global_stats.npz"
+    recompute: false
+
+  # Усиленные аугментации для борьбы с переобучением
+  augmentations:
+    enabled: true
+    hflip:
+      enabled: true
+      prob: 0.5
+    vflip:
+      enabled: true
+      prob: 0.5
+    rotate90:
+      enabled: true
+      prob: 0.5
+    # Новые аугментации
+    random_rotation:
+      enabled: true
+      degrees: 15
+      prob: 0.3
+    random_crop:
+      enabled: true
+      scale: [0.9, 1.0]
+      prob: 0.3
+    color_jitter:
+      enabled: true
+      brightness: 0.1
+      contrast: 0.1
+      prob: 0.2
+    gaussian_noise:
+      enabled: true
+      std: 0.02  # Увеличили с 0.01
+      prob: 0.3  # Увеличили с 0.2
+    gaussian_blur:
+      enabled: true
+      kernel_size: 3
+      prob: 0.2
+    random_gamma:
+      enabled: true
+      range: [0.8, 1.2]  # Расширили с [0.9, 1.1]
+      prob: 0.4  # Увеличили с 0.3
+    mixup:
+      enabled: true
+      alpha: 0.2
+      prob: 0.2
+
+  loader:
+    workers: 24
+    persistent_workers: true
+    prefetch_factor: 4
+    pin_memory: true
+    drop_last: true
+    shuffle: true
+
+split:
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+  stratified: true
+  max_val_samples: 4000
+  cache_dir: "runs/splits"
+  reuse_cached: true
+
+train:
+  epochs: 65
+  current_epoch: 0
+  batch_size: 256
+  grad_accum_steps: 1
+  lr: 0.0005  # Уменьшили с 0.00065
+  weight_decay: 0.08  # Увеличили с 0.05
+  betas: [0.9, 0.999]
+  ema_decay: 0.999
+  max_grad_norm: 1.0
+  early_stopping_patience: 5  # Уменьшили с 8 до 5 для более ранней остановки
+  log_every_n_steps: 25
+  tensorboard:
+    enabled: true
+    log_dir: "runs/tensorboard"
+  
+  # Улучшенный scheduler
+  scheduler:
+    name: "warmup_plateau"
+    warmup_epochs: 5  # Увеличили с 3
+    factor: 0.7  # Увеличили с 0.5 для более агрессивного снижения
+    patience: 1  # Уменьшили с 2 для более быстрой реакции
+    cooldown: 1
+    min_lr: 5.0e-7  # Уменьшили с 1.0e-6
+    threshold: 5.0e-4  # Увеличили с 1.0e-4
+    threshold_mode: "rel"
+    mode: "max"
+    metric: "f1_micro"
+  
+  bce_pos_weight: auto
+  label_smoothing: 0.1  # Увеличили с 0.05
+  loss_reduction: "mean"
+
+eval:
+  threshold: 0.45
+  batch_size: 256
+  metrics_output: "runs/metrics"
+
+logging:
+  out_dir: "runs"
+  project_name: "interferogram_cnn_anti_overfitting"
+  run_name: null
+  save_every: 1
+  keep_last_k: 8
+  dump_config: true
+  env_report: true
+
+checkpoint:
+  path: "/home/jupyter/work/resources/neuro/runs"
+
+testing:
+  smoke_samples: 96
