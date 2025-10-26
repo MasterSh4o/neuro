@@ -32,6 +32,15 @@ data:
   img_glob: "**/*.png,**/*.jpg,**/*.tif,**/*.bmp"
   image_size: 512                     # Increased resolution for sub-micron detection
 
+  # Resolution enhancement configuration
+  resolution_enhancement:
+    enabled: true                    # Enable resolution analysis and upscaling
+    target_resolution: 1024            # Target resolution for sub-micron precision
+    analysis_threshold: 0.8           # Threshold for resolution improvement
+    preserve_fringes: true            # Preserve interferometric fringe patterns
+    upscaling_method: "adaptive"       # adaptive, sr_cnn, bicubic, lanczos
+    adaptive_threshold: 0.3            # Threshold for adaptive method selection
+
   # Korsch objective displacement parameters
   label_parsing:
     filename_label_regex: "(\d{1,3})"      # Support larger numbers for 6-8 bits

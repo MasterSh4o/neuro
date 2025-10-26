@@ -8,6 +8,21 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+# Импорт для апскейлинга
+try:
+    from utils.interferogram_enhancement import (
+        ResolutionConfig,
+        InterferogramAnalyzer,
+        enhance_interferogram_batch,
+        create_interferogram_upsampler
+    )
+except ImportError:
+    # Fallback для случаев, когда utils недоступен
+    ResolutionConfig = None
+    InterferogramAnalyzer = None
+    enhance_interferogram_batch = None
+    create_interferogram_upsampler = None
+
 
 def extract_ints_no_regex(base: str) -> list[int]:
     """
@@ -208,6 +223,11 @@ class InterferogramDataset(Dataset):
         mirror_count: int = 2,
         linear_range_um: float = 1000.0,
         angular_range_arcsec: float = 60.0,
+        # Resolution enhancement parameters
+        resolution_enhancement: dict | None = None,
+        target_resolution: int | None = None,
+        upscaling_method: str = "adaptive",  # adaptive, sr_cnn, bicubic, lanczos
+        preserve_fringes: bool = True,
         # Standard parameters
         augment: bool = True,
         aug_cfg: dict | None = None,
@@ -237,6 +257,38 @@ class InterferogramDataset(Dataset):
         self.mirror_count = int(mirror_count)
         self.linear_range_um = float(linear_range_um)
         self.angular_range_arcsec = float(angular_range_arcsec)
+
+        # Resolution enhancement parameters
+        self.resolution_enhancement = deepcopy(resolution_enhancement) if resolution_enhancement else {}
+        self.target_resolution = int(target_resolution) if target_resolution is not None else None
+        self.upscaling_method = str(upscaling_method)
+        self.preserve_fringes = bool(preserve_fringes)
+
+        # Resolution analysis
+        self._resolution_analyzer = None
+        self._upscaler = None
+        self._resolution_analysis_cache = {}
+
+        if ResolutionConfig is not None:
+            # Инициализация анализатора разрешения
+            self._resolution_analyzer = InterferogramAnalyzer()
+
+            # Конфигурация улучшения разрешения
+            self._resolution_config = ResolutionConfig(
+                target_resolution=self.target_resolution or 1024,
+                min_resolution=256,
+                analysis_threshold=self.resolution_enhancement.get("analysis_threshold", 0.8),
+                preserve_fringes=self.preserve_fringes,
+                enhancement_method=upscaling_method
+            )
+
+            # Предварительное создание апскейлера если нужно
+            if upscaling_method != "adaptive":
+                self._upscaler = create_interferogram_upsampler(
+                    method=upscaling_method,
+                    scale_factor=4,
+                    target_resolution=self.target_resolution
+                )
 
         self.normalization_cfg = deepcopy(normalization) if normalization else {}
         self.norm_type = str(self.normalization_cfg.get("type", "none")).lower()

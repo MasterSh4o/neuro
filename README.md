@@ -284,7 +284,22 @@ The system automatically tracks and resumes training progress:
 - **Sub-micron accuracy**: 60-80% predictions within 1 μm / 1"
 - **Memory usage**: ~2GB for batch size 1024 (A100 optimized)
 
-### Scaling Precision
+### Resolution Analysis & Requirements
+
+#### 256×256 Resolution Analysis
+- **Adequate for**: 5-bit precision (~15.6 μm linear, ~0.94" angular)
+- **Insufficient for**: <1 μm / <1" sub-micron precision
+- **Enhancement needed**: For 6-8 bit precision with sub-micron accuracy
+- **Recommended upscaling**: 4× to 1024×1024 for <1 μm capability
+
+#### Resolution vs Capability
+| Current Resolution | Native Precision | Sub-μm Capable | Upscaling Required | Final Capability |
+|------------------|-------------------|------------------|-------------------|-------------------|
+| 256×256          | ~15.6 μm / ~0.94" | ❌              | Yes (4×)        | <2 μm / <0.2"    |
+| 512×512          | ~7.8 μm / ~0.47"   | ✅ (hybrid)    | Optional (2×)   | <1 μm / <0.1"    |
+| 1024×1024        | ~3.9 μm / ~0.23"   | ✅              | No               | <1 μm / <1"      |
+
+#### Scaling Precision
 | Bits/Parameter | Linear Step | Angular Step | Sub-μm Capable | Memory (GB) |
 |---------------|---------------|----------------|------------------|---------------|
 | 6             | 15.6 μm      | 0.94"          | ❌              | 1.5           |
