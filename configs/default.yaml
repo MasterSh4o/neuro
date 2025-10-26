@@ -1,4 +1,8 @@
-# configs/default.yaml — v8
+# configs/default.yaml — v9: Korsch Objective High-Precision Displacement Detection
+# Universal PyTorch project for grayscale interferogram analysis (512×512 for sub-micron precision)
+# Task: Determine 3D displacements of mirrors in Korsch objective system
+# Target precision: <1 μm linear, <1" angular using hybrid classification+regression
+# Output: 10 parameters (5 per mirror × 6-8 bits) + regression for fine correction
 seed: 42
 device: cuda
 precision: amp            # amp | fp32
@@ -6,25 +10,36 @@ channels_last: true
 torch_compile: true
 
 model:
-  base_channels: 32
-  width_multipliers: [2, 4, 8, 12]
-  block_repeats: [1, 1, 1, 1]
-  norm: groupnorm         # batchnorm | groupnorm
+  base_channels: 64            # Increased for sub-micron detail detection
+  width_multipliers: [2, 4, 8, 16]  # Enhanced feature extraction
+  block_repeats: [2, 2, 2, 2]      # Deeper architecture for precision
+  norm: groupnorm                     # batchnorm | groupnorm
   gn_groups: 16
   stochastic_depth: 0.1
   dropout: 0.2
 
+  # Korsch precision parameters
+  out_dim: 70                       # 2 mirrors × 5 params × 7 bits (configurable)
+  bits_per_parameter: 7              # 6-8 bits for <1 μm/" precision
+  use_hybrid_head: true               # Classification + regression for <1 precision
+  regression_dim: 10                 # 10 regression outputs (1 per parameter)
+  head_dropout: 0.3
+  head_norm: "layernorm"
+  hidden_dims: [2048, 1024, 512]   # Enhanced MLP head for precision
+
 data:
   root: "/path/to/data/root"
   img_glob: "**/*.png,**/*.jpg,**/*.tif,**/*.bmp"
-  image_size: 256
+  image_size: 512                     # Increased resolution for sub-micron detection
 
+  # Korsch objective displacement parameters
   label_parsing:
-    filename_label_regex: "(\d{1,2})"
-    numbers_total: 11
-    ignore_last_number: true
-    bits_per_number: 5
-    value_mode: "mod"      # mod | clip | raise
+    filename_label_regex: "(\d{1,3})"      # Support larger numbers for 6-8 bits
+    numbers_total: 10                       # 2 mirrors × 5 parameters = 10
+    ignore_last_number: false                 # Use all 10 parameters
+    bits_per_number: 7                      # 7 bits for <1 μm/" precision
+    value_mode: "mod"                       # mod | clip | raise
+    parameter_types: ["angular_x", "angular_y", "linear_x", "linear_y", "linear_z"]  # 5 per mirror
 
   normalization:
     type: "global_zscore"  # none | global_zscore
@@ -33,23 +48,35 @@ data:
 
   augmentations:
     enabled: true
+    # Reduced geometric transforms for sub-micron precision preservation
     hflip:
       enabled: true
-      prob: 0.5
+      prob: 0.3                      # Reduced probability
     vflip:
       enabled: true
-      prob: 0.5
+      prob: 0.3                      # Reduced probability
     rotate90:
-      enabled: true
-      prob: 0.5
+      enabled: false                     # Disabled - preserves fine details
+    random_rotation:
+      enabled: false                     # Disabled - no small rotations
     gaussian_noise:
       enabled: true
-      std: 0.01
-      prob: 0.2
+      std: 0.005                      # Reduced noise level
+      prob: 0.1                       # Reduced probability
     random_gamma:
       enabled: true
-      range: [0.9, 1.1]
-      prob: 0.3
+      range: [0.95, 1.05]              # Tighter range for stability
+      prob: 0.2                       # Reduced probability
+    # New precision-preserving augmentations
+    gaussian_blur:
+      enabled: true
+      kernel_size: 1                    # Minimal blur to reduce artifacts
+      prob: 0.05
+    color_jitter:
+      enabled: true
+      brightness: 0.02                  # Minimal brightness changes
+      contrast: 0.02                   # Minimal contrast changes
+      prob: 0.1
 
   loader:
     workers: 8
@@ -69,24 +96,37 @@ split:
   reuse_cached: true
 
 train:
-  epochs: 50
-  batch_size: 256
-  grad_accum_steps: 1
-  lr: 0.0007
-  weight_decay: 0.05
+  epochs: 100                     # Increased training for precision tasks
+  batch_size: 256                 # Will be scaled for DataSphere A100
+  grad_accum_steps: 4              # Increased for memory efficiency
+  lr: 0.0003                     # Lower LR for precision
+  weight_decay: 0.01               # Reduced for precision
   betas: [0.9, 0.999]
   ema_decay: 0.999
   max_grad_norm: 1.0
-  early_stopping_patience: 10
-  log_every_n_steps: 50
+  early_stopping_patience: 15       # Increased patience
+  log_every_n_steps: 25           # More frequent logging
+
+  # Hybrid loss configuration
+  loss:
+    classification_weight: 1.0        # BCE loss weight
+    regression_weight: 0.3            # MSE loss weight for fine correction
+    regression_scale_factor: 4.0       # Scale regression targets
+
+  # Advanced scheduler for precision
+  scheduler:
+    name: "warmup_plateau"           # Adaptive LR scheduling
+    warmup_epochs: 8
+    factor: 0.5
+    patience: 5
+    cooldown: 2
+    min_lr: 5.0e-7
+    metric: "mae_linear_um"           # Track physical precision
+    mode: "min"
+
   tensorboard:
     enabled: true
     log_dir: "runs/tensorboard"
-  scheduler:
-    name: "cosine_warmup"
-    warmup_epochs: 5
-    min_lr: 1.0e-6
-  bce_pos_weight: auto   # auto | none
 
 eval:
   threshold: 0.5         # порог для multilabel

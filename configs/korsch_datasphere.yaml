@@ -1,0 +1,91 @@
+# configs/korsch_datasphere.yaml — Korsch High-Precision on Yandex DataSphere A100 80GB
+# Optimized for 28 vCPU, 196GB RAM, A100 80GB GPU
+# Target: Sub-micron linear and sub-arcsecond angular precision
+
+# Base configuration extends default.yaml
+defaults:
+  - default
+
+# Environment settings
+workspace_root: "/home/jupyter/work"          # DataSphere workspace
+
+# DataSphere optimized batch sizes and workers
+train:
+  batch_size: 1024                         # Maximum for A100 80GB
+  grad_accum_steps: 2                         # Memory efficiency
+
+data:
+  root: "/home/jupyter/work/datasets/KorschInterfDataset"
+  image_size: 512                             # High resolution for precision
+
+  loader:
+    workers: 28                               # Full vCPU utilization
+    persistent_workers: true
+    prefetch_factor: 8                          # Large prefetch
+    pin_memory: true
+    drop_last: true
+    shuffle: true
+
+# Model optimization for large GPU
+model:
+  base_channels: 128                          # Maximum channels for detail
+  width_multipliers: [2, 4, 8, 16, 32]      # Extra scale
+  block_repeats: [2, 3, 3, 3, 3]            # Very deep
+  out_dim: 80                                # 2 mirrors × 5 params × 8 bits
+  bits_per_parameter: 8                       # Maximum precision
+  use_hybrid_head: true
+  regression_dim: 10
+  head_dropout: 0.2                           # Slightly reduced for large model
+  hidden_dims: [4096, 2048, 1024, 512]     # Large MLP
+
+# Training optimized for long runs
+train:
+  epochs: 200                                 # Extended training
+  lr: 0.0001                                # Very low LR
+  weight_decay: 0.005                          # Very low for stability
+  ema_decay: 0.9995                            # Higher EMA for precision
+
+  # Precision loss configuration
+  loss:
+    classification_weight: 1.0
+    regression_weight: 0.5                      # Higher regression weight
+    regression_scale_factor: 8.0                 # Larger scale
+
+  # DataSphere scheduler
+  scheduler:
+    name: "warmup_plateau"
+    warmup_epochs: 12
+    factor: 0.3                                 # Aggressive reduction
+    patience: 3
+    cooldown: 1
+    min_lr: 1.0e-7
+    metric: "mae_linear_um"
+
+# Logging paths relative to workspace
+logging:
+  out_dir: "runs/korsch_high_precision"
+  project_name: "korsch_interferometer"
+  save_every: 5
+  keep_last_k: 10
+  dump_config: true
+  env_report: true
+
+# Checkpointing with DataSphere paths
+checkpoint:
+  path: null  # Will be set by launcher script
+
+# Memory and optimization settings
+precision: amp
+channels_last: true
+torch_compile: true
+
+# Testing configuration
+testing:
+  smoke_samples: 100                          # Extended smoke test
+
+# DataSphere specific settings
+datasphere:
+  max_gpu_memory_gb: 80                       # Full A100 capacity
+  use_distributed: false                       # Single GPU mode
+  mixed_precision: true
+  gradient_checkpointing: true                  # Memory optimization

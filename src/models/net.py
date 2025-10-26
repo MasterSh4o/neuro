@@ -125,6 +125,9 @@ class InterferoNetMultiLabel(nn.Module):
         hidden_dims: Optional[Sequence[int]] = None,
         head_dropout: float = 0.3,
         head_norm: str = "layernorm",
+        # Параметры для повышения точности
+        use_hybrid_head: bool = False,  # Гибрид: классификация + регрессия
+        regression_dim: int = 10,       # Количество регрессионных выходов
     ):
         super().__init__()
         width_multipliers = tuple(width_multipliers)
@@ -133,6 +136,8 @@ class InterferoNetMultiLabel(nn.Module):
             raise ValueError("width_multipliers and block_repeats must have the same length.")
         self.out_dim = out_dim
         self.base_channels = base_channels
+        self.use_hybrid_head = use_hybrid_head
+        self.regression_dim = regression_dim
 
         stem_channels = base_channels
         self.stem = nn.Sequential(
@@ -184,8 +189,24 @@ class InterferoNetMultiLabel(nn.Module):
                 mlp_layers.append(nn.Dropout(p=head_dropout))
             prev_dim = dim
         self.head = nn.Sequential(*mlp_layers) if mlp_layers else nn.Identity()
-        self.classifier = nn.Linear(prev_dim, out_dim)
         self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+
+        # Гибридный выход: классификация + регрессия
+        if self.use_hybrid_head:
+            # Классификационный выход (коarse дискретизация)
+            self.classifier = nn.Linear(prev_dim, out_dim)
+            # Регрессионный выход (fine коррекция для субмикронной точности)
+            self.regression_head = nn.Sequential(
+                nn.Linear(prev_dim, prev_dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=head_dropout),
+                nn.Linear(prev_dim // 2, regression_dim)
+            )
+        else:
+            # Стандартный классификационный выход
+            self.classifier = nn.Linear(prev_dim, out_dim)
+            self.regression_head = None
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -200,7 +221,7 @@ class InterferoNetMultiLabel(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         x = self.stem(x)
         x = self.pool(x)
         x = self.backbone(x)
@@ -208,5 +229,13 @@ class InterferoNetMultiLabel(nn.Module):
         x = self.global_pool(x).flatten(1)
         x = self.head(x)
         x = self.dropout(x)
-        x = self.classifier(x)
-        return x
+
+        if self.use_hybrid_head:
+            # Гибридный выход: классификация + регрессия
+            classification = self.classifier(x)
+            regression = self.regression_head(x)
+            return classification, regression
+        else:
+            # Стандартный классификационный выход
+            x = self.classifier(x)
+            return x

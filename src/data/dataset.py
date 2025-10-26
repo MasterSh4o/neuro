@@ -31,10 +31,10 @@ def extract_ints_no_regex(base: str) -> list[int]:
 
 def parse_bits_from_basename(
     base: str,
-    numbers_total: int = 11,
-    bits_per_number: int = 5,
+    numbers_total: int = 10,
+    bits_per_number: int = 7,
     value_mode: str = "mod",
-    ignore_last_number: bool = True,
+    ignore_last_number: bool = False,
 ) -> np.ndarray:
     ints = extract_ints_no_regex(base)
     if len(ints) < numbers_total:
@@ -63,6 +63,88 @@ def parse_bits_from_basename(
         for k in range(bits_per_number):
             out[i * bits_per_number + k] = (value >> k) & 1
     return out
+
+
+def parse_korsch_displacements(
+    base: str,
+    mirror_count: int = 2,
+    bits_per_parameter: int = 7,
+    linear_range_um: float = 1000.0,
+    angular_range_arcsec: float = 60.0,
+    value_mode: str = "mod",
+) -> tuple[np.ndarray, dict]:
+    """
+    Парсинг смещений объектива Корша из имени файла.
+
+    Returns:
+        binary_vector: Бинарный вектор для обучения
+        physical_values: Словарь с физическими значениями для валидации
+    """
+    ints = extract_ints_no_regex(base)
+
+    # Ожидаемое количество параметров: зеркала × параметры
+    expected_params = mirror_count * 5
+    if len(ints) < expected_params:
+        raise ValueError(
+            f"'{base}': found {len(ints)} numbers, expected >= {expected_params} "
+            f"for {mirror_count} mirrors with 5 parameters each. Parsed={ints}"
+        )
+
+    picked = ints[:expected_params]
+
+    # Валидация диапазонов
+    max_value = (1 << bits_per_parameter) - 1
+
+    match value_mode:
+        case "mod":
+            picked = [v & max_value for v in picked]
+        case "clip":
+            picked = [max(0, min(max_value, v)) for v in picked]
+        case "raise":
+            for v in picked:
+                if not (0 <= v <= max_value):
+                    raise ValueError(f"value {v} out of range [0,{max_value}] in '{base}'")
+        case _:
+            picked = [v & max_value for v in picked]
+
+    # Создание бинарного вектора
+    binary_vector = np.zeros(len(picked) * bits_per_parameter, dtype=np.float32)
+    for i, value in enumerate(picked):
+        for k in range(bits_per_parameter):
+            binary_vector[i * bits_per_parameter + k] = (value >> k) & 1
+
+    # Расчет физических значений для валидации
+    levels = 1 << bits_per_parameter
+    linear_step_um = linear_range_um / levels
+    angular_step_arcsec = angular_range_arcsec / levels
+
+    physical_values = {}
+    for mirror in range(mirror_count):
+        mirror_data = {}
+
+        for param_idx in range(5):
+            param_idx_global = mirror * 5 + param_idx
+            discrete_value = picked[param_idx_global]
+
+            # Преобразование в физические единицы
+            if param_idx < 2:  # Угловые параметры X, Y
+                physical_value = (discrete_value - levels // 2) * angular_step_arcsec
+                param_name = f'angular_{["x", "y"][param_idx]}'
+                unit = 'arcsec'
+            else:  # Линейные параметры X, Y, Z
+                physical_value = (discrete_value - levels // 2) * linear_step_um
+                param_name = f'linear_{["x", "y", "z"][param_idx - 2]}'
+                unit = 'um'
+
+            mirror_data[param_name] = {
+                'value': physical_value,
+                'unit': unit,
+                'discrete_level': discrete_value
+            }
+
+        physical_values[f'mirror_{mirror + 1}'] = mirror_data
+
+    return binary_vector, physical_values
 
 
 DEFAULT_AUG_CFG = {
@@ -114,13 +196,19 @@ class InterferogramDataset(Dataset):
         self,
         root: str,
         img_glob: str = "**/*.png,**/*.jpg,**/*.tif,**/*.bmp",
-        image_size: int = 256,
+        image_size: int = 512,
         *,
         filename_label_regex: str | None = None,  # для обратной совместимости
-        numbers_total: int = 11,
-        bits_per_number: int = 5,
+        numbers_total: int = 10,               # 2 зеркала × 5 параметров
+        bits_per_number: int = 7,              # Для субмикронной точности
         value_mode: str = "mod",
-        ignore_last_number: bool = True,
+        ignore_last_number: bool = False,        # Используем все параметры
+        # Korsch specific parameters
+        korsch_mode: bool = False,              # Использовать Korch парсинг
+        mirror_count: int = 2,
+        linear_range_um: float = 1000.0,
+        angular_range_arcsec: float = 60.0,
+        # Standard parameters
         augment: bool = True,
         aug_cfg: dict | None = None,
         label_cfg: dict | None = None,
@@ -143,6 +231,12 @@ class InterferogramDataset(Dataset):
         self.bits_per_number = int(bits_per_number)
         self.value_mode = value_mode
         self.ignore_last_number = bool(ignore_last_number)
+
+        # Korsch specific parameters
+        self.korsch_mode = bool(korsch_mode)
+        self.mirror_count = int(mirror_count)
+        self.linear_range_um = float(linear_range_um)
+        self.angular_range_arcsec = float(angular_range_arcsec)
 
         self.normalization_cfg = deepcopy(normalization) if normalization else {}
         self.norm_type = str(self.normalization_cfg.get("type", "none")).lower()
@@ -188,15 +282,29 @@ class InterferogramDataset(Dataset):
             labels_list: list[np.ndarray] = []
             for path in self.files:
                 base = os.path.splitext(os.path.basename(path))[0]
-                labels_list.append(
-                    parse_bits_from_basename(
+
+                if self.korsch_mode:
+                    # Используем Korsch парсинг с валидацией
+                    binary_vector, physical_values = parse_korsch_displacements(
                         base,
-                        numbers_total=self.numbers_total,
-                        bits_per_number=self.bits_per_number,
+                        mirror_count=self.mirror_count,
+                        bits_per_parameter=self.bits_per_number,
+                        linear_range_um=self.linear_range_um,
+                        angular_range_arcsec=self.angular_range_arcsec,
                         value_mode=self.value_mode,
-                        ignore_last_number=self.ignore_last_number,
                     )
-                )
+                    labels_list.append(binary_vector)
+                else:
+                    # Стандартный парсинг для обратной совместимости
+                    labels_list.append(
+                        parse_bits_from_basename(
+                            base,
+                            numbers_total=self.numbers_total,
+                            bits_per_number=self.bits_per_number,
+                            value_mode=self.value_mode,
+                            ignore_last_number=self.ignore_last_number,
+                        )
+                    )
             self.labels = np.stack(labels_list, axis=0).astype(np.float32)
 
         self.K = int(self.labels.shape[1])
