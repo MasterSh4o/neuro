@@ -7,15 +7,10 @@ defaults:
   - default
 
 # Environment settings
-workspace_root: "/home/jupyter/work"          # DataSphere workspace
-
-# DataSphere optimized batch sizes and workers
-train:
-  batch_size: 1024                         # Maximum for A100 80GB
-  grad_accum_steps: 2                         # Memory efficiency
+workspace_root: "/home/jupyter/work/resources/neuro"          # DataSphere workspace
 
 data:
-  root: "/home/jupyter/work/datasets/KorschInterfDataset"
+  root: "../../datasets/InterfDataset"
   image_size: 512                             # High resolution for precision
 
   loader:
@@ -39,7 +34,10 @@ model:
   hidden_dims: [4096, 2048, 1024, 512]     # Large MLP
 
 # Training optimized for long runs
+# DataSphere optimized batch sizes and workers
 train:
+  batch_size: 1024                         # Maximum for A100 80GB
+  grad_accum_steps: 2                         # Memory efficiency
   epochs: 200                                 # Extended training
   lr: 0.0001                                # Very low LR
   weight_decay: 0.005                          # Very low for stability
@@ -77,7 +75,7 @@ checkpoint:
 # Memory and optimization settings
 precision: amp
 channels_last: true
-torch_compile: true
+torch_compile: false
 
 # Testing configuration
 testing:

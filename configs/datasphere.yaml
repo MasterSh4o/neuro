@@ -4,7 +4,7 @@ device: cuda
 precision: amp
 channels_last: true
 torch_compile: false
-workspace_root: "/home/jupyter/work"
+workspace_root: "/home/jupyter/work/resources/neuro"
 
 model:
   base_channels: 32
