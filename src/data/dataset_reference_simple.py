@@ -11,6 +11,7 @@ Simple Dataset with Reference Interferogram Support
 """
 
 import os
+import glob
 import cv2
 import numpy as np
 import torch
@@ -132,45 +133,201 @@ class ReferenceInterferogramDataset(Dataset):
         self.global_mean = None
         self.global_std = None
 
-        # Загрузка файлов
-        self._load_dataset()
+        # Валидация и загрузка файлов
+        self._validate_and_load_dataset()
 
-    def _load_dataset(self) -> None:
-        """Загрузка набора данных."""
-        # Поиск файлов
-        patterns = [
-            p.strip() for p in str(self.img_glob).replace(";", ",").split(",") if p.strip()
-        ]
-        discovered = []
-        for pat in patterns:
-            discovered.extend(
-                os.path.join(self.root, pat) for pat in patterns
-            )
+    def _validate_and_load_dataset(self) -> None:
+        """Валидация и загрузка набора данных с улучшенной диагностикой."""
+        # Проверка существования директории
+        if not os.path.exists(self.root):
+            raise FileNotFoundError(f"Dataset directory does not exist: {self.root}")
 
-        discovered = sorted(set([os.path.abspath(f) for f in discovered if os.path.exists(f)]))
+        if not os.path.isdir(self.root):
+            raise NotADirectoryError(f"Path is not a directory: {self.root}")
+
+        # Валидация и нормализация шаблонов
+        patterns = self._validate_and_normalize_patterns()
+
+        # Поиск файлов с диагностикой
+        discovered = self._discover_files_with_diagnostic(patterns)
+
         if not discovered:
-            raise RuntimeError(f"No images found in '{self.root}' with patterns: {patterns}")
+            # Предложить альтернативы и решения
+            self._handle_no_files_found(patterns)
 
+        print(f"[INFO] Found {len(discovered)} images in dataset")
         self.files = discovered
         self.paths = [os.path.relpath(f, self.root) for f in self.files]
-        print(f"Found {len(self.files)} images in dataset")
 
         # Парсинг меток
+        self._parse_labels()
+
+    def _validate_and_normalize_patterns(self) -> list:
+        """Валидация и нормализация шаблонов поиска."""
+        raw_patterns = str(self.img_glob).replace(";", ",").split(",")
+        patterns = [p.strip() for p in raw_patterns if p.strip()]
+
+        if not patterns:
+            raise ValueError("No search patterns provided in img_glob")
+
+        # Валидация шаблонов
+        valid_extensions = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp']
+        for pattern in patterns:
+            if not any(pattern.lower().endswith(ext) for ext in valid_extensions):
+                if not pattern.startswith('**/'):
+                    print(f"[WARNING] Pattern '{pattern}' might not match image files")
+
+        print(f"[DEBUG] Using patterns: {patterns}")
+        return patterns
+
+    def _discover_files_with_diagnostic(self, patterns: list) -> list:
+        """Поиск файлов с подробной диагностикой."""
+        print(f"[DEBUG] Searching for images in: {self.root}")
+
+        discovered = []
+        pattern_results = []
+
+        for pat in patterns:
+            search_path = os.path.join(self.root, pat)
+            print(f"[DEBUG] Searching pattern: {search_path}")
+
+            try:
+                matches = glob.glob(search_path, recursive=True)
+                print(f"[DEBUG] Found {len(matches)} files with pattern '{pat}'")
+
+                # Фильтрация только файлов изображений
+                valid_matches = []
+                image_extensions = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp']
+                for match in matches:
+                    if os.path.isfile(match):
+                        if any(match.lower().endswith(ext) for ext in image_extensions):
+                            valid_matches.append(match)
+
+                if len(valid_matches) != len(matches):
+                    print(f"[DEBUG] Filtered {len(matches) - len(valid_matches)} non-image files")
+
+                discovered.extend(valid_matches)
+                pattern_results.append({
+                    'pattern': pat,
+                    'matches': len(valid_matches),
+                    'examples': [os.path.basename(m) for m in valid_matches[:3]]
+                })
+
+            except Exception as e:
+                print(f"[ERROR] Error searching pattern '{pat}': {e}")
+
+        # Удаление дубликатов и сортировка
+        discovered = sorted(set([os.path.abspath(f) for f in discovered if os.path.exists(f)]))
+
+        # Показать результаты по шаблонам
+        print(f"[DEBUG] Pattern summary:")
+        for pr in pattern_results:
+            status = "✅" if pr['matches'] > 0 else "❌"
+            examples = f" ({', '.join(pr['examples'])})" if pr['examples'] else ""
+            print(f"   {status} {pr['pattern']}: {pr['matches']} files{examples}")
+
+        return discovered
+
+    def _handle_no_files_found(self, patterns: list) -> None:
+        """Обработка случая, когда файлы не найдены."""
+        print(f"[DEBUG] No files found. Analyzing directory...")
+
+        # Анализ директории
+        try:
+            contents = os.listdir(self.root)
+            print(f"[DEBUG] Directory contains {len(contents)} items")
+
+            # Поиск изображений независимо от шаблонов
+            image_extensions = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp']
+            found_images = []
+            subdirectories = []
+
+            for item in contents:
+                item_path = os.path.join(self.root, item)
+                if os.path.isdir(item_path):
+                    subdirectories.append(item)
+                elif any(item.lower().endswith(ext) for ext in image_extensions):
+                    found_images.append(item)
+
+            print(f"[DEBUG] Found {len(found_images)} image files, {len(subdirectories)} subdirectories")
+
+            if found_images:
+                print(f"[DEBUG] Image files found: {found_images[:5]}")
+                # Предложить лучшие шаблоны
+                extensions_found = set()
+                for img in found_images:
+                    if '.' in img:
+                        extensions_found.add(img.split('.')[-1].lower())
+
+                suggested_patterns = []
+                for ext in extensions_found:
+                    suggested_patterns.append(f"**/*.{ext}")
+
+                print(f"[DEBUG] Suggested patterns: {suggested_patterns}")
+                print(f"[DEBUG] Try updating your config: img_glob: {suggested_patterns}")
+
+            elif subdirectories:
+                print(f"[DEBUG] Subdirectories: {subdirectories[:5]}")
+                print(f"[DEBUG] Images might be in subdirectories. Try patterns: ['**/*.png']")
+
+            else:
+                print(f"[DEBUG] Directory appears to be empty or contains no image files")
+
+        except Exception as e:
+            print(f"[DEBUG] Could not analyze directory: {e}")
+
+        # Финальное сообщение об ошибке с советами
+        error_msg = f"No images found in '{self.root}' with patterns: {patterns}"
+        suggestions = [
+            "1. Check if the dataset directory exists and contains image files",
+            "2. Verify the image patterns match your file names",
+            "3. Use recursive patterns like '**/*.png' to search subdirectories",
+            "4. Run: python diagnose_dataset.py '{}' for detailed diagnosis".format(self.root)
+        ]
+
+        error_msg_with_suggestions = error_msg + "\n" + "\n".join(f"Suggestion: {s}" for s in suggestions)
+        raise RuntimeError(error_msg_with_suggestions)
+
+    def _parse_labels(self) -> None:
+        """Парсинг меток из имен файлов."""
         self.labels = []
         for path in self.files:
             base = os.path.splitext(os.path.basename(path))[0]
 
             if self.korsch_mode:
                 # Парсинг смещений Корша
-                label = self._parse_korsch_displacement(base)
+                try:
+                    # Импортируем функцию парсинга
+                    from .dataset import parse_korsch_displacements
+                    binary_vector, physical_values = parse_korsch_displacements(
+                        base,
+                        mirror_count=2,
+                        bits_per_parameter=self.bits_per_number,
+                        linear_range_um=self.linear_range_um,
+                        angular_range_arcsec=self.angular_range_arcsec,
+                        value_mode="mod"
+                    )
+                    self.labels.append(binary_vector)
+                except Exception as e:
+                    print(f"[WARNING] Failed to parse Korsch displacements from '{base}': {e}")
+                    # Создаем нулевой вектор как запасной вариант
+                    K = 10 * self.bits_per_number  # 2 mirrors × 5 parameters × bits
+                    self.labels.append(np.zeros(K, dtype=np.float32))
             else:
-                # Стандартный парсинг
-                label = self._parse_standard_label(base)
-
-            self.labels.append(label)
+                # Запасной вариант - простые числа из имени файла
+                import re
+                numbers = re.findall(r'\d+', base)
+                if numbers:
+                    self.labels.append([float(n) for n in numbers[:10]])  # Максимум 10 параметров
+                else:
+                    self.labels.append([0.0] * 10)  # Запасной вариант
 
         self.labels = np.array(self.labels, dtype=np.float32)
-        print(f"Parsed {len(self.labels)} labels for {self.bits_per_number} bits per parameter")
+        print(f"[DEBUG] Parsed {len(self.labels)} labels")
+
+    def _load_dataset(self) -> None:
+        """Загрузка набора данных (устаревший метод для совместимости)."""
+        self._validate_and_load_dataset()
 
     def _parse_korsch_displacement(self, base: str) -> np.ndarray:
         """Парсинг смещений Корша из имени файла."""

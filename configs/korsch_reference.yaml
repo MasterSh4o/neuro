@@ -8,8 +8,8 @@ defaults:
 # Reference interferogram settings
 reference_interferogram:
   enabled: true
-  path: "/home/jupyter/work/datasets/reference_ideal_interferogram.png"
-  mode: "difference"                    # "difference" (current - reference) or "dual_input"
+  path: "/home/jupyter/datasphere/project/neuro/ideal.bmp"
+  mode: "dual_input"                    # "difference" (current - reference) or "dual_input"
   preprocessing:
     normalize_difference: true            # Normalize difference to zero mean, unit std
     gaussian_blur:
@@ -21,7 +21,8 @@ reference_interferogram:
       enabled: false                    # Usually not needed for difference mode
 
 # Training modifications for reference mode
-data:
+data:  
+  root: "../../datasets/InterfDataset"
   # Use the enhanced dataset with reference support
   korsch_mode: true
   resolution_enhancement:
