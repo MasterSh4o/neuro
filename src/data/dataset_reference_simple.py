@@ -76,6 +76,11 @@ class ReferenceInterferogramDataset(Dataset):
         self.target_resolution = target_resolution
         self.enable_augmentations = enable_augmentations
 
+        # Нормализация для совместимости с train.py
+        self.norm_type = "none"  # Reference dataset handles its own normalization
+        self.global_mean = None
+        self.global_std = None
+
         # Загрузка файлов
         self._load_dataset()
 
@@ -118,39 +123,115 @@ class ReferenceInterferogramDataset(Dataset):
 
     def _parse_korsch_displacement(self, base: str) -> np.ndarray:
         """Парсинг смещений Корша из имени файла."""
-        # Ожидаемый формат: mirror1_ax_ay_lx_ly_lz_mirror2_ax_ay_lx_ly_lz.png
-        parts = base.split('_mirror')
-        if len(parts) < 2:
-            raise ValueError(f"Invalid Korsch filename format: {base}")
+        # Поддерживаемые форматы:
+        # 1. Int_  0_  0_ 31_ 10_ 22_  6_ 27_ 17_  3_ 23_0.bmp
+        # 2. mirror1_ax_ay_lx_ly_lz_mirror2_ax_ay_lx_ly_lz.png
 
-        displacements = []
-        for mirror_part in parts[1:]:
-            if not mirror_part:
-                continue
+        # Сначала пытаемся формат "Int_"
+        if base.startswith('Int_'):
+            # Извлекаем все числа после "Int_"
+            numbers_str = base[4:]  # убираем "Int_"
+            numbers = []
 
-            params = mirror_part.split('_')
-            if len(params) != 5:
-                raise ValueError(f"Invalid mirror parameters: {mirror_part}")
+            # Разделяем по подчеркиваниям и фильтруем пустые строки
+            parts = [p.strip() for p in numbers_str.split('_') if p.strip()]
 
-            # Преобразование в биты
-            binary_vector = []
-            for param_str in params:
+            for part in parts:
                 try:
-                    param_value = int(param_str)
+                    numbers.append(int(part))
                 except ValueError:
-                    param_value = 0
+                    continue
 
-                # Ограничение диапазона
-                max_value = (1 << self.bits_per_number) - 1
-                param_value = param_value & max_value
+            # Ожидаем 10 параметров (2 зеркала × 5 параметров)
+            expected_numbers = 10
+            while len(numbers) < expected_numbers:
+                numbers.append(0)
 
-                # Преобразование в бинарный вектор
-                for bit_pos in range(self.bits_per_number):
-                    binary_vector.append((param_value >> bit_pos) & 1)
+            # Ограничение первыми 10 числами
+            numbers = numbers[:expected_numbers]
 
-            displacements.extend(binary_vector)
+        else:
+            # Стандартный формат с "_mirror"
+            parts = base.split('_mirror')
+            if len(parts) < 2:
+                # Если не подошло ни один формат, используем стандартный парсинг
+                return self._parse_standard_label(base)
 
-        return np.array(displacements, dtype=np.float32)
+            numbers = []
+            for mirror_part in parts[1:]:
+                if not mirror_part:
+                    continue
+
+                params = mirror_part.split('_')
+                if len(params) != 5:
+                    continue
+
+                for param_str in params:
+                    try:
+                        numbers.append(int(param_str))
+                    except ValueError:
+                        numbers.append(0)
+
+            # Заполняем недостающие параметры нулями
+            expected_numbers = 10  # 2 зеркала × 5 параметров
+            while len(numbers) < expected_numbers:
+                numbers.append(0)
+            numbers = numbers[:expected_numbers]
+
+        # Преобразование в биты
+        binary_vector = []
+        for num in numbers:
+            # Ограничение диапазона
+            max_value = (1 << self.bits_per_number) - 1
+            param_value = num & max_value
+
+            # Преобразование в бинарный вектор
+            for bit_pos in range(self.bits_per_number):
+                binary_vector.append((param_value >> bit_pos) & 1)
+
+        return np.array(binary_vector, dtype=np.float32)
+
+    def set_global_stats(self, mean: float, std: float) -> None:
+        """Установка глобальных статистик для совместимости."""
+        self.global_mean = mean
+        self.global_std = std
+
+    def compute_global_stats(self, indices: np.ndarray) -> Tuple[float, float]:
+        """Вычисление глобальных статистик для совместимости."""
+        # Возвращаем стандартные значения, т.к. эталонный датасет сам обрабатывает нормализацию
+        # indices не используются, но нужны для совместимости интерфейса
+        _ = indices  # Подавляем предупреждение о неиспользуемом параметре
+        return 0.0, 1.0
+
+    def make_subset(self, indices: np.ndarray, augment: bool = False, share_stats: bool = True) -> 'ReferenceInterferogramDataset':
+        """Создание поднабора для совместимости с train.py."""
+        subset = ReferenceInterferogramDataset(
+            root=self.root,
+            img_glob=self.img_glob,
+            image_size=self.image_size,
+            korsch_mode=self.korsch_mode,
+            bits_per_number=self.bits_per_number,
+            linear_range_um=self.linear_range_um,
+            angular_range_arcsec=self.angular_range_arcsec,
+            reference_path=self.reference_path,
+            mode=self.mode,
+            reference_preprocessing=self.reference_processor.preprocessing if self.reference_processor else None,
+            resolution_enhancement=self.resolution_enhancement,
+            target_resolution=self.target_resolution,
+            enable_augmentations=augment,
+        )
+
+        # Фильтруем файлы и метки по индексам
+        subset.files = [self.files[i] for i in indices]
+        subset.paths = [self.paths[i] for i in indices]
+        subset.labels = self.labels[indices]
+
+        # Копируем нормализацию
+        if share_stats and hasattr(self, 'global_mean'):
+            subset.global_mean = self.global_mean
+            subset.global_std = self.global_std
+
+        return subset
 
     def _parse_standard_label(self, base: str) -> np.ndarray:
         """Стандартный парсинг меток."""

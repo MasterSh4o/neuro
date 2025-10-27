@@ -646,10 +646,16 @@ def main():
         print(f"[INFO] Using reference interferogram mode: {reference_mode}")
         print(f"[INFO] Reference path: {reference_path}")
 
+        # Handle image_size format for reference dataset
+        if isinstance(image_size, int):
+            image_size_tuple = (image_size, image_size)
+        else:
+            image_size_tuple = image_size
+
         full_ds = ReferenceInterferogramDataset(
             root=root,
             img_glob=img_glob,
-            image_size=image_size,
+            image_size=image_size_tuple,
             korsch_mode=korsch_mode,
             bits_per_number=bits_per_number,
             reference_path=reference_path,

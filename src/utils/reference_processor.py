@@ -48,8 +48,14 @@ class ReferenceProcessor:
             raise RuntimeError(f"Failed to load reference image: {self.reference_path}")
 
         # Изменение размера
-        if img.shape[:2] != self.target_size:
-            img = cv2.resize(img, (self.target_size[1], self.target_size[0]), interpolation=cv2.INTER_AREA)
+        # Handle both int and tuple inputs for target_size
+        if isinstance(self.target_size, int):
+            target_size = (self.target_size, self.target_size)
+        else:
+            target_size = self.target_size
+
+        if img.shape[:2] != target_size:
+            img = cv2.resize(img, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
 
         # Применение препроцессинга
         processed = img.astype(np.float32)

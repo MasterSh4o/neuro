@@ -1,0 +1,86 @@
+# Debug configuration for dataset testing
+# This config is used when the main dataset is not available
+
+seed: 42
+device: cuda
+precision: amp
+channels_last: true
+
+# Basic data configuration for testing
+data:
+  root: "sample_interferograms"
+  img_glob: "**/*.png"
+  image_size: 256
+  korsch_mode: true
+  bits_per_number: 5  # Reduced for quick testing
+  linear_range_um: 10.0
+  angular_range_arcsec: 100.0
+
+  # Disable augmentations for testing
+  augmentations:
+    enabled: false
+
+  # Simple loader configuration
+  loader:
+    workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+
+# Simple model configuration
+model:
+  out_dim: 50  # 2 mirrors × 5 params × 5 bits
+  base_channels: 32
+  width_multipliers: [2, 4, 8]
+  block_repeats: [1, 1, 2]
+  norm: "groupnorm"
+  gn_groups: 16
+  dropout: 0.1
+  head_dropout: 0.1
+
+# Training configuration
+train:
+  epochs: 5  # Quick test run
+  batch_size: 8
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+  ema_decay: 0.999
+  bce_pos_weight: "auto"
+  loss_reduction: "mean"
+
+  scheduler:
+    name: "cosine_warmup"
+    warmup_epochs: 1
+    min_lr: 0.00001
+
+  log_every_n_steps: 10
+  early_stopping_patience: 10
+
+# Evaluation configuration
+eval:
+  batch_size: 16
+  threshold: 0.5
+
+# Data split
+split:
+  train_ratio: 0.8
+  val_ratio: 0.2
+  test_ratio: 0.0
+  stratified: true
+
+# Logging configuration
+logging:
+  out_dir: "runs/debug_training"
+  project_name: "debug_dataset"
+  run_name: null
+  dump_config: true
+  env_report: true
+  save_every: 1
+  keep_last_k: 2
+
+# Reference interferogram (disabled for initial testing)
+reference_interferogram:
+  enabled: false
+  mode: "difference"

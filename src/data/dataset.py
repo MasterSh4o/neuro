@@ -8,6 +8,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from utils.path_utils import validate_path, safe_join, sanitize_path
+from utils.memory_manager import ReferenceImageManager, default_reference_manager
+
 # Импорт для апскейлинга
 try:
     from utils.interferogram_enhancement import (
@@ -321,31 +324,75 @@ class InterferogramDataset(Dataset):
 
         # Load reference interferogram if provided
         if self.reference_interferogram is not None:
-            if os.path.isabs(self.reference_interferogram):
-                ref_path = self.reference_interferogram
+            # Sanitize path and validate
+            sanitized_ref_path = sanitize_path(self.reference_interferogram)
+            if os.path.isabs(sanitized_ref_path):
+                ref_path = sanitized_ref_path
             else:
-                ref_path = os.path.join(self.root, self.reference_interferogram)
+                ref_path = safe_join(self.root, sanitized_ref_path)
 
-            if not os.path.exists(ref_path):
-                raise FileNotFoundError(f"Reference interferogram not found: {ref_path}")
+            # Validate path
+            is_valid, error = validate_path(ref_path, must_exist=True, must_be_file=True)
+            if not is_valid:
+                raise FileNotFoundError(f"Invalid reference interferogram path: {error}")
 
-            self.reference_image = self._read_image(ref_path)
-            print(f"Loaded reference interferogram: {ref_path}, shape: {self.reference_image.shape}")
+            # Use memory-efficient reference image manager
+            self.reference_manager = default_reference_manager
+            self.reference_image_loader = self.reference_manager.load_reference_image(ref_path)
+
+            # For backward compatibility, keep eager loading option
+            enable_lazy_loading = True  # Could be made configurable
+            if not enable_lazy_loading:
+                self.reference_image = self.reference_image_loader()
+                print(f"Loaded reference interferogram (eager): {ref_path}, shape: {self.reference_image.shape}")
+            else:
+                self.reference_image = None
+                print(f"Reference interferogram configured for lazy loading: {ref_path}")
+        else:
+            self.reference_manager = None
+            self.reference_image_loader = None
+            self.reference_image = None
 
         if files is not None and labels is not None:
-            abs_files = [os.path.abspath(os.path.join(self.root, f)) if not os.path.isabs(f) else os.path.abspath(f) for f in files]
+            # Validate and sanitize file paths
+            abs_files = []
+            for f in files:
+                sanitized_f = sanitize_path(str(f))
+                if os.path.isabs(sanitized_f):
+                    file_path = sanitized_f
+                else:
+                    file_path = safe_join(self.root, sanitized_f)
+
+                is_valid, error = validate_path(file_path, must_exist=True, must_be_file=True)
+                if not is_valid:
+                    raise FileNotFoundError(f"Invalid file path: {error}")
+
+                abs_files.append(os.path.abspath(file_path))
+
             self.files = abs_files
             self.paths = [os.path.relpath(f, self.root) for f in self.files]
             self.labels = np.asarray(labels, dtype=np.float32)
         else:
-            patterns = [
-                p.strip() for p in str(img_glob).replace(";", ",").split(",") if p.strip()
-            ]
+            # Sanitize patterns
+            raw_patterns = str(img_glob).replace(";", ",").split(",")
+            patterns = [sanitize_path(p.strip()) for p in raw_patterns if p.strip()]
+
             discovered: list[str] = []
             for pat in patterns:
-                discovered.extend(
-                    glob.glob(os.path.join(self.root, pat), recursive=True)
-                )
+                # Safe pattern joining
+                search_path = safe_join(self.root, pat)
+                try:
+                    matches = glob.glob(search_path, recursive=True)
+                    # Validate each discovered file
+                    for match in matches:
+                        is_valid, error = validate_path(match, must_exist=True, must_be_file=True)
+                        if is_valid:
+                            discovered.append(match)
+                except Exception as e:
+                    # Skip dangerous patterns
+                    print(f"Warning: Skipping unsafe pattern '{pat}': {e}")
+                    continue
+
             discovered = sorted({os.path.abspath(f) for f in discovered})
             if not discovered:
                 raise RuntimeError(
@@ -384,6 +431,28 @@ class InterferogramDataset(Dataset):
 
         self.K = int(self.labels.shape[1])
 
+    def cleanup_memory(self) -> None:
+        """
+        Clean up memory used by the dataset.
+        """
+        if hasattr(self, 'reference_manager') and self.reference_manager:
+            self.reference_manager.clear_cache()
+
+        # Clear reference image if loaded eagerly
+        if hasattr(self, 'reference_image') and self.reference_image is not None:
+            self.reference_image = None
+
+        # Force garbage collection
+        import gc
+        gc.collect()
+
+    def __del__(self):
+        """Destructor to ensure memory cleanup."""
+        try:
+            self.cleanup_memory()
+        except:
+            pass  # Ignore errors during cleanup
+
     def __len__(self) -> int:
         return len(self.files)
 
@@ -402,6 +471,37 @@ class InterferogramDataset(Dataset):
             img = img / 255.0
         return img
 
+    def _get_reference_image(self) -> Optional[np.ndarray]:
+        """
+        Get reference interferogram image with memory-efficient loading.
+
+        Returns:
+            Optional[np.ndarray]: Reference image or None if not configured
+        """
+        if self.reference_image_loader is None:
+            return None
+
+        try:
+            # Load reference image using lazy loader
+            ref_img = self.reference_image_loader()
+
+            # Ensure correct size and format
+            if ref_img.shape[0] != self.image_size or ref_img.shape[1] != self.image_size:
+                ref_img = cv2.resize(
+                    ref_img,
+                    (self.image_size, self.image_size),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            # Ensure correct data type and range
+            if ref_img.max() > 1.5 or ref_img.min() < -0.5:
+                ref_img = ref_img / 255.0
+
+            return ref_img.astype(np.float32)
+
+        except Exception as e:
+            raise RuntimeError(f"Error loading reference interferogram: {e}")
+
     def _compute_difference_interferogram(self, current_img: np.ndarray) -> np.ndarray:
         """
         Вычисление разностной интерферограммы (текущая - эталонная).
@@ -412,19 +512,21 @@ class InterferogramDataset(Dataset):
         Returns:
             Разностная интерферограмма
         """
-        if self.reference_image is None:
+        # Get reference image using memory-efficient loading
+        reference_image = self._get_reference_image()
+        if reference_image is None:
             return current_img  # Нет эталона, возвращаем оригинал
 
         # Проверка размеров
-        if current_img.shape != self.reference_image.shape:
+        if current_img.shape != reference_image.shape:
             # Изменение размера эталона под текущую интерферограмму
             ref_resized = cv2.resize(
-                self.reference_image,
+                reference_image,
                 (current_img.shape[1], current_img.shape[0]),
                 interpolation=cv2.INTER_AREA
             )
         else:
-            ref_resized = self.reference_image
+            ref_resized = reference_image
 
         # Применение препроцессинга к эталону если нужно
         if self.reference_preprocessing:
@@ -640,56 +742,14 @@ class InterferogramDataset(Dataset):
 
     def __getitem__(self, idx: int):
         rel_path = self.paths[idx]
-        full_path = os.path.join(self.root, rel_path)
-        img = self._read_image(full_path)
+        # Use safe_join for path construction
+        full_path = safe_join(self.root, rel_path)
 
-        if self.norm_type == "per_image_zscore":
-            img = self._per_image_zscore(img)
+        # Validate path before reading
+        is_valid, error = validate_path(full_path, must_exist=True, must_be_file=True)
+        if not is_valid:
+            raise FileNotFoundError(f"Invalid image path at index {idx}: {error}")
 
-        img = self._augment(img)
-
-        if self.norm_type == "global_zscore" and self.global_mean is not None:
-            img = (img - self.global_mean) / (self.global_std + 1e-6)
-
-        if self.clip_range is not None:
-            lo, hi = self.clip_range
-            img = np.clip(img, lo, hi)
-
-        img = np.expand_dims(np.ascontiguousarray(img, dtype=np.float32), axis=0)
-        x = torch.from_numpy(img)
-        y = torch.from_numpy(self.labels[idx]).float()
-        side = None
-        return x, y, side, rel_path
-        if idx_array.size == 0:
-            raise ValueError("Subset indices must be non-empty")
-
-        subset_files = [self.files[i] for i in idx_array]
-        subset_labels = self.labels[idx_array].copy()
-
-        normalization = deepcopy(self.normalization_cfg)
-        if share_stats and self.global_mean is not None:
-            normalization["mean"] = self.global_mean
-            normalization["std"] = self.global_std
-
-        subset = InterferogramDataset(
-            root=self.root,
-            img_glob=self.img_glob,
-            image_size=self.image_size,
-            numbers_total=self.numbers_total,
-            bits_per_number=self.bits_per_number,
-            value_mode=self.value_mode,
-            ignore_last_number=self.ignore_last_number,
-            augment=self.augment_flag if augment is None else bool(augment),
-            augmentations=deepcopy(self.aug_cfg),
-            normalization=normalization,
-            files=subset_files,
-            labels=subset_labels,
-        )
-        return subset
-
-    def __getitem__(self, idx: int):
-        rel_path = self.paths[idx]
-        full_path = os.path.join(self.root, rel_path)
         img = self._read_image(full_path)
 
         if self.norm_type == "per_image_zscore":
