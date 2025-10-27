@@ -3,6 +3,11 @@ Simple Dataset with Reference Interferogram Support
 
 Упрощенный датасет с поддержкой эталонной интерферограммы
 для достижения субмикронной точности.
+
+Поддерживаемые форматы image_size:
+- int: 512 (преобразуется в (512, 512))
+- tuple: (512, 512)
+- list: [512, 512]
 """
 
 import os
@@ -10,7 +15,7 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Union, List
 
 from .reference_processor import ReferenceProcessor
 
@@ -29,7 +34,7 @@ class ReferenceInterferogramDataset(Dataset):
         self,
         root: str,
         img_glob: str = "**/*.png,**/*.jpg,**/*.tif,**/*.bmp",
-        image_size: Tuple[int, int] = (512, 512),
+        image_size: Union[int, Tuple[int, int], List[int]] = (512, 512),
         *,
         # Korsch параметры
         korsch_mode: bool = True,
@@ -49,14 +54,52 @@ class ReferenceInterferogramDataset(Dataset):
     ):
         super().__init__()
         self.root = os.path.abspath(root)
-        self.image_size = image_size
+
+        # Преобразование image_size в tuple для совместимости
+        if isinstance(image_size, int):
+            if image_size <= 0:
+                raise ValueError(f"image_size must be positive integer, got {image_size}")
+            self.image_size = (image_size, image_size)
+        elif isinstance(image_size, (tuple, list)):
+            if len(image_size) != 2:
+                raise ValueError(f"image_size must have exactly 2 elements, got {len(image_size)}")
+            if any(size <= 0 for size in image_size):
+                raise ValueError(f"All image_size elements must be positive, got {image_size}")
+            self.image_size = tuple(image_size)
+        else:
+            raise TypeError(f"image_size must be int or tuple/list, got {type(image_size)}")
+
         self.img_glob = img_glob
+
+        # Валидация основных параметров
+        if not isinstance(img_glob, str):
+            raise TypeError(f"img_glob must be a string, got {type(img_glob)}")
+        if not img_glob.strip():
+            raise ValueError("img_glob cannot be empty")
+
+        # Валидация Korsch параметров
+        if not isinstance(korsch_mode, bool):
+            raise TypeError(f"korsch_mode must be boolean, got {type(korsch_mode)}")
+        if not isinstance(bits_per_number, int) or bits_per_number <= 0:
+            raise ValueError(f"bits_per_number must be positive integer, got {bits_per_number}")
+        if not isinstance(linear_range_um, (int, float)) or linear_range_um <= 0:
+            raise ValueError(f"linear_range_um must be positive number, got {linear_range_um}")
+        if not isinstance(angular_range_arcsec, (int, float)) or angular_range_arcsec <= 0:
+            raise ValueError(f"angular_range_arcsec must be positive number, got {angular_range_arcsec}")
 
         # Korsch параметры
         self.korsch_mode = korsch_mode
         self.bits_per_number = bits_per_number
         self.linear_range_um = linear_range_um
         self.angular_range_arcsec = angular_range_arcsec
+
+        # Валидация параметров эталона
+        if mode not in ["normal", "difference", "dual"]:
+            raise ValueError(f"mode must be 'normal', 'difference', or 'dual', got '{mode}'")
+        if reference_path is not None and not isinstance(reference_path, str):
+            raise TypeError(f"reference_path must be string or None, got {type(reference_path)}")
+        if reference_preprocessing is not None and not isinstance(reference_preprocessing, dict):
+            raise TypeError(f"reference_preprocessing must be dictionary or None, got {type(reference_preprocessing)}")
 
         # Параметры эталона
         self.mode = mode
@@ -70,6 +113,14 @@ class ReferenceInterferogramDataset(Dataset):
                 target_size=self.image_size,
                 preprocessing=reference_preprocessing
             )
+
+        # Валидация параметров разрешения и аугментаций
+        if not isinstance(resolution_enhancement, bool):
+            raise TypeError(f"resolution_enhancement must be boolean, got {type(resolution_enhancement)}")
+        if target_resolution is not None and (not isinstance(target_resolution, int) or target_resolution <= 0):
+            raise ValueError(f"target_resolution must be positive integer or None, got {target_resolution}")
+        if not isinstance(enable_augmentations, bool):
+            raise TypeError(f"enable_augmentations must be boolean, got {type(enable_augmentations)}")
 
         # Разрешение и аугментации
         self.resolution_enhancement = resolution_enhancement
@@ -262,7 +313,7 @@ class ReferenceInterferogramDataset(Dataset):
 
         # Изменение размера
         if img.shape[:2] != self.image_size:
-            img = cv2.resize(img, self.image_size, interpolation=cv2.INTER_AREA)
+            img = cv2.resize(img, (self.image_size[1], self.image_size[0]), interpolation=cv2.INTER_AREA)
 
         img = img.astype(np.float32)
         if img.max() > 1.5:

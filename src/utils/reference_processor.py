@@ -8,7 +8,7 @@ import os
 import cv2
 import numpy as np
 import torch
-from typing import Tuple, Optional, Dict, Any, Union
+from typing import Tuple, Optional, Dict, Any, Union, List
 
 
 class ReferenceProcessor:
@@ -19,17 +19,41 @@ class ReferenceProcessor:
     def __init__(
         self,
         reference_path: str,
-        target_size: Tuple[int, int] = (512, 512),
+        target_size: Union[int, Tuple[int, int]] = (512, 512),
         preprocessing: Optional[Dict[str, Any]] = None
     ):
         """
         Args:
             reference_path: Путь к эталонной интерферограмме
-            target_size: Целевой размер изображений
+            target_size: Целевой размер изображений (int или tuple)
             preprocessing: Параметры препроцессинга эталона
         """
+        # Валидация пути к эталонному изображению
+        if not isinstance(reference_path, str):
+            raise TypeError(f"reference_path must be a string, got {type(reference_path)}")
+        if not reference_path.strip():
+            raise ValueError("reference_path cannot be empty")
+
         self.reference_path = reference_path
-        self.target_size = target_size
+
+        # Преобразование target_size в tuple для совместимости
+        if isinstance(target_size, int):
+            if target_size <= 0:
+                raise ValueError(f"target_size must be positive integer, got {target_size}")
+            self.target_size = (target_size, target_size)
+        elif isinstance(target_size, (tuple, list)):
+            if len(target_size) != 2:
+                raise ValueError(f"target_size must have exactly 2 elements, got {len(target_size)}")
+            if any(size <= 0 for size in target_size):
+                raise ValueError(f"All target_size elements must be positive, got {target_size}")
+            self.target_size = tuple(target_size)
+        else:
+            raise TypeError(f"target_size must be int or tuple/list, got {type(target_size)}")
+
+        # Валидация параметров препроцессинга
+        if preprocessing is not None and not isinstance(preprocessing, dict):
+            raise TypeError(f"preprocessing must be a dictionary or None, got {type(preprocessing)}")
+
         self.preprocessing = preprocessing or {}
 
         # Загрузка и обработка эталона
@@ -48,14 +72,8 @@ class ReferenceProcessor:
             raise RuntimeError(f"Failed to load reference image: {self.reference_path}")
 
         # Изменение размера
-        # Handle both int and tuple inputs for target_size
-        if isinstance(self.target_size, int):
-            target_size = (self.target_size, self.target_size)
-        else:
-            target_size = self.target_size
-
-        if img.shape[:2] != target_size:
-            img = cv2.resize(img, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
+        if img.shape[:2] != self.target_size:
+            img = cv2.resize(img, (self.target_size[1], self.target_size[0]), interpolation=cv2.INTER_AREA)
 
         # Применение препроцессинга
         processed = img.astype(np.float32)
