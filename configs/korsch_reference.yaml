@@ -9,7 +9,7 @@ defaults:
 reference_interferogram:
   enabled: true
   path: "/home/jupyter/datasphere/project/neuro/ideal.bmp"
-  mode: "dual_input"                    # "difference" (current - reference) or "dual_input"
+  mode: "dual"                    # "difference" (current - reference) or "dual_input"
   preprocessing:
     normalize_difference: true            # Normalize difference to zero mean, unit std
     gaussian_blur:

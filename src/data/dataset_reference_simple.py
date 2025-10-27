@@ -18,7 +18,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Optional, Dict, Any, Tuple, Union, List
 
-from .reference_processor import ReferenceProcessor
+from utils.reference_processor import ReferenceProcessor
 
 
 class ReferenceInterferogramDataset(Dataset):
@@ -318,12 +318,20 @@ class ReferenceInterferogramDataset(Dataset):
                 import re
                 numbers = re.findall(r'\d+', base)
                 if numbers:
-                    self.labels.append([float(n) for n in numbers[:10]])  # Максимум 10 параметров
+                    extracted_numbers = [float(n) for n in numbers[:10]]  # Максимум 10 параметров
                 else:
-                    self.labels.append([0.0] * 10)  # Запасной вариант
+                    extracted_numbers = [0.0] * 10  # Запасной вариант
+
+                # Преобразуем в биты для совместимости с korsch_mode
+                binary_vector = []
+                for num in extracted_numbers:
+                    for bit_pos in range(self.bits_per_number):
+                        binary_vector.append((int(num) >> bit_pos) & 1)
+                self.labels.append(np.array(binary_vector, dtype=np.float32))
 
         self.labels = np.array(self.labels, dtype=np.float32)
-        print(f"[DEBUG] Parsed {len(self.labels)} labels")
+        self.K = int(self.labels.shape[1])  # Добавляем атрибут K для совместимости с train.py
+        print(f"[DEBUG] Parsed {len(self.labels)} labels, K={self.K}")
 
     def _load_dataset(self) -> None:
         """Загрузка набора данных (устаревший метод для совместимости)."""
@@ -438,6 +446,10 @@ class ReferenceInterferogramDataset(Dataset):
         if share_stats and hasattr(self, 'global_mean'):
             subset.global_mean = self.global_mean
             subset.global_std = self.global_std
+
+        # Копируем атрибут K
+        if hasattr(self, 'K'):
+            subset.K = self.K
 
         return subset
 

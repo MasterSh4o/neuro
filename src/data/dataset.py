@@ -1,7 +1,7 @@
 import os
 import glob
 from copy import deepcopy
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, Optional
 
 import cv2
 import numpy as np
