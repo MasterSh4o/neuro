@@ -32,6 +32,16 @@ data:
   img_glob: "**/*.png,**/*.jpg,**/*.tif,**/*.bmp"
   image_size: 512                     # Increased resolution for sub-micron detection
 
+  # Reference interferogram configuration
+  reference_interferogram:
+    enabled: false                    # Enable reference interferogram usage
+    path: null                       # Path to ideal/reference interferogram
+    mode: "difference"                # "difference", "dual_input", "normal"
+    preprocessing:
+      normalize_difference: true         # Normalize difference values
+      gaussian_blur: {"kernel_size": 1}   # Smooth reference image
+      # Additional preprocessing can be added here
+
   # Resolution enhancement configuration
   resolution_enhancement:
     enabled: true                    # Enable resolution analysis and upscaling

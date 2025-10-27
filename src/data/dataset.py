@@ -223,6 +223,10 @@ class InterferogramDataset(Dataset):
         mirror_count: int = 2,
         linear_range_um: float = 1000.0,
         angular_range_arcsec: float = 60.0,
+        # Reference interferogram parameters
+        reference_interferogram: str | None = None,  # Path to ideal reference
+        use_difference_mode: bool = False,            # Compute difference (current - reference)
+        reference_preprocessing: dict | None = None,  # Reference-specific processing
         # Resolution enhancement parameters
         resolution_enhancement: dict | None = None,
         target_resolution: int | None = None,
@@ -257,6 +261,12 @@ class InterferogramDataset(Dataset):
         self.mirror_count = int(mirror_count)
         self.linear_range_um = float(linear_range_um)
         self.angular_range_arcsec = float(angular_range_arcsec)
+
+        # Reference interferogram parameters
+        self.reference_interferogram = reference_interferogram
+        self.use_difference_mode = bool(use_difference_mode)
+        self.reference_preprocessing = deepcopy(reference_preprocessing) if reference_preprocessing else {}
+        self.reference_image = None  # Loaded reference image
 
         # Resolution enhancement parameters
         self.resolution_enhancement = deepcopy(resolution_enhancement) if resolution_enhancement else {}
@@ -308,6 +318,19 @@ class InterferogramDataset(Dataset):
         aug_cfg = augmentations if augmentations is not None else aug_cfg
         self.aug_cfg = _normalize_aug_cfg(aug_cfg, aug_cfg if augmentations is None else None)
         self.augment_flag = bool(augment) and bool(self.aug_cfg.get("enabled", True))
+
+        # Load reference interferogram if provided
+        if self.reference_interferogram is not None:
+            if os.path.isabs(self.reference_interferogram):
+                ref_path = self.reference_interferogram
+            else:
+                ref_path = os.path.join(self.root, self.reference_interferogram)
+
+            if not os.path.exists(ref_path):
+                raise FileNotFoundError(f"Reference interferogram not found: {ref_path}")
+
+            self.reference_image = self._read_image(ref_path)
+            print(f"Loaded reference interferogram: {ref_path}, shape: {self.reference_image.shape}")
 
         if files is not None and labels is not None:
             abs_files = [os.path.abspath(os.path.join(self.root, f)) if not os.path.isabs(f) else os.path.abspath(f) for f in files]
@@ -378,6 +401,74 @@ class InterferogramDataset(Dataset):
         if img.max() > 1.5 or img.min() < -0.5:
             img = img / 255.0
         return img
+
+    def _compute_difference_interferogram(self, current_img: np.ndarray) -> np.ndarray:
+        """
+        Вычисление разностной интерферограммы (текущая - эталонная).
+
+        Args:
+            current_img: Текущая интерферограмма
+
+        Returns:
+            Разностная интерферограмма
+        """
+        if self.reference_image is None:
+            return current_img  # Нет эталона, возвращаем оригинал
+
+        # Проверка размеров
+        if current_img.shape != self.reference_image.shape:
+            # Изменение размера эталона под текущую интерферограмму
+            ref_resized = cv2.resize(
+                self.reference_image,
+                (current_img.shape[1], current_img.shape[0]),
+                interpolation=cv2.INTER_AREA
+            )
+        else:
+            ref_resized = self.reference_image
+
+        # Применение препроцессинга к эталону если нужно
+        if self.reference_preprocessing:
+            ref_processed = self._apply_reference_preprocessing(ref_resized)
+        else:
+            ref_processed = ref_resized
+
+        # Вычисление разности
+        difference = current_img.astype(np.float32) - ref_processed.astype(np.float32)
+
+        # Нормализация разности
+        if self.reference_preprocessing.get("normalize_difference", True):
+            # Статистическая нормализация разности
+            diff_mean = np.mean(difference)
+            diff_std = np.std(difference)
+            if diff_std > 1e-6:
+                difference = (difference - diff_mean) / diff_std
+
+        return difference
+
+    def _apply_reference_preprocessing(self, reference_img: np.ndarray) -> np.ndarray:
+        """
+        Применение препроцессинга к эталонной интерферограмме.
+        """
+        processed = reference_img.copy()
+
+        # Применение фильтров если указаны
+        if "gaussian_blur" in self.reference_preprocessing:
+            kernel_size = self.reference_preprocessing["gaussian_blur"].get("kernel_size", 1)
+            if kernel_size > 0 and kernel_size % 2 == 1:
+                processed = cv2.GaussianBlur(processed, (kernel_size, kernel_size), 0)
+
+        if "contrast_enhancement" in self.reference_preprocessing:
+            factor = self.reference_preprocessing["contrast_enhancement"].get("factor", 1.0)
+            if factor != 1.0:
+                mean = processed.mean()
+                processed = (processed - mean) * factor + mean
+
+        if "brightness_adjustment" in self.reference_preprocessing:
+            offset = self.reference_preprocessing["brightness_adjustment"].get("offset", 0.0)
+            if offset != 0.0:
+                processed = processed + offset
+
+        return processed
 
     def _per_image_zscore(self, img: np.ndarray) -> np.ndarray:
         mean = float(img.mean())

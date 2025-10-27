@@ -33,6 +33,7 @@ from utils.common import set_seed, load_config, human_int
 from utils.metrics import MultilabelMetrics
 from utils.scheduler import CosineWarmupLR, WarmupReduceLROnPlateau, WarmupReduceLROnPlateauConfig
 from data.dataset import InterferogramDataset
+from data.dataset_reference_simple import ReferenceInterferogramDataset
 from models.net import InterferoNetMultiLabel
 
 
@@ -55,6 +56,42 @@ def collate_fn(batch):
     y = _T.stack(ys, dim=0).float()
     side = None
     return x, y, side, list(rels)
+
+
+def reference_collate_fn(batch):
+    """Collate function for reference interferogram datasets."""
+    import torch as _T
+
+    # Handle different return formats from dataset
+    if len(batch[0]) == 3:  # (img, diff_or_label, mode_info)
+        xs, second_inputs, mode_infos = zip(*batch)
+
+        # Check if we're in dual_input mode (second_input is tensor) or difference mode (second_input is label)
+        if isinstance(second_inputs[0], _T.Tensor):
+            # Dual input mode: (img, dual_input, mode_info)
+            x = _T.stack(xs, dim=0)  # [B, 1, H, W] or [B, 2, H, W]
+            y = None  # Labels extracted from mode_info
+            dual_input = _T.stack(second_inputs, dim=0)
+        else:
+            # Difference mode or labels included: (img, label, mode_info)
+            x = _T.stack(xs, dim=0)
+            y = _T.stack([_T.from_numpy(np.array(si)) if si is not None else _T.zeros(80)
+                          for si in second_inputs], dim=0).float()
+            dual_input = None
+    else:
+        # Standard format: (x, y, side, rels)
+        xs, ys, sides, rels = zip(*batch)
+        x = _T.stack(xs, dim=0)
+        y = _T.stack(ys, dim=0).float()
+        dual_input = None
+        mode_infos = rels
+
+    # Extract labels from mode_info if needed
+    if y is None and mode_infos:
+        y = _T.stack([_T.from_numpy(np.array(mode_info.get('label', np.zeros(80))))
+                     for mode_info in mode_infos], dim=0).float()
+
+    return x, y, dual_input, mode_infos
 
 
 def mixup_data(x, y, alpha=0.2):
@@ -394,26 +431,58 @@ def evaluate(
     use_amp: bool,
     threshold: float,
     channels_last: bool,
+    use_reference: bool = False,
 ) -> Dict[str, Any]:
     if loader is None:
         return {}
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    num_classes = getattr(loader.dataset, "K", None)
+    num_classes = getattr(loader.dataset, "K", 80)  # Default to 80 for Korsch reference
     meter = MultilabelMetrics(num_classes=num_classes, threshold=threshold, device=device)
+
     with torch.no_grad():
-        for x, y, _, _ in loader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            if channels_last:
-                x = x.contiguous(memory_format=torch.channels_last)
-            with autocast_ctx(device_type, use_amp):
-                logits = model(x)
-                loss = criterion(logits, y)
+        for batch_data in loader:
+            if use_reference and len(batch_data) == 4:  # (x, y, dual_input, mode_info)
+                x, y, dual_input, mode_info = batch_data
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+
+                if dual_input is not None:
+                    dual_input = dual_input.to(device, non_blocking=True)
+
+                if channels_last:
+                    x = x.contiguous(memory_format=torch.channels_last)
+                    if dual_input is not None:
+                        dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+
+                with autocast_ctx(device_type, use_amp):
+                    # Model can handle dual input or single input
+                    if dual_input is not None and hasattr(model, 'forward') and 'dual_input' in model.forward.__code__.co_varnames:
+                        logits = model(x, dual_input)
+                    elif dual_input is not None:
+                        # Concatenate dual input if model expects single input
+                        combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
+                        logits = model(combined)
+                    else:
+                        logits = model(x)
+
+                    loss = criterion(logits, y)
+            else:
+                # Standard evaluation
+                x, y, _, _ = batch_data
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                if channels_last:
+                    x = x.contiguous(memory_format=torch.channels_last)
+                with autocast_ctx(device_type, use_amp):
+                    logits = model(x)
+                    loss = criterion(logits, y)
+
             total_loss += float(loss.item()) * y.size(0)
             total_samples += y.size(0)
             meter.update(logits, y)
+
     metrics = meter.compute()
     metrics["loss"] = float(total_loss / max(1, total_samples))
     return metrics
@@ -444,7 +513,11 @@ def build_dataloader(
     persistent_workers: bool,
     prefetch_factor: Optional[int],
     generator: Optional[torch.Generator] = None,
+    use_reference: bool = False,
 ) -> DataLoader:
+    # Choose appropriate collate function based on dataset type
+    collate_func = reference_collate_fn if use_reference or isinstance(dataset, ReferenceInterferogramDataset) else collate_fn
+
     kwargs = dict(
         batch_size=batch_size,
         shuffle=shuffle,
@@ -452,7 +525,7 @@ def build_dataloader(
         pin_memory=pin_memory,
         drop_last=drop_last,
         persistent_workers=persistent_workers if num_workers > 0 else False,
-        collate_fn=collate_fn,
+        collate_fn=collate_func,
     )
     if num_workers > 0 and prefetch_factor is not None:
         kwargs["prefetch_factor"] = int(prefetch_factor)
@@ -513,7 +586,11 @@ def main():
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
 
-    if hasattr(torch, "set_float32_matmul_precision"):
+    # Use new API for TF32 precision settings (PyTorch 2.0+)
+    if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+    # Fallback to old API for compatibility
+    elif hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
 
     device_str = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -528,36 +605,83 @@ def main():
     img_glob = data_cfg.get("img_glob", "**/*.png,**/*.jpg,**/*.tif,**/*.bmp")
     image_size = int(data_cfg.get("image_size", 256))
 
-    label_cfg = data_cfg.get("label_parsing", {})
-    numbers_total = int(label_cfg.get("numbers_total", data_cfg.get("numbers_total", 11)))
-    bits_per_number = int(label_cfg.get("bits_per_number", data_cfg.get("bits_per_number", 5)))
-    value_mode = label_cfg.get("value_mode", data_cfg.get("value_mode", "mod"))
-    ignore_last_number = bool(label_cfg.get("ignore_last_number", data_cfg.get("ignore_last_number", True)))
-    filename_label_regex = label_cfg.get("filename_label_regex", data_cfg.get("filename_label_regex", None))
+    # Check for reference interferogram configuration
+    reference_cfg = cfg.get("reference_interferogram", {})
+    use_reference = bool(reference_cfg.get("enabled", False))
+    reference_mode = reference_cfg.get("mode", "difference")  # "difference", "dual_input", or "normal"
+    reference_path = reference_cfg.get("path", None) if use_reference else None
+    reference_preprocessing = reference_cfg.get("preprocessing", {})
+
+    # Korsch configuration
+    korsch_mode = bool(data_cfg.get("korsch_mode", False))
+    bits_per_number = int(data_cfg.get("bits_per_number", 5))
+
+    # For Korsch mode, we expect 10 parameters (2 mirrors × 5 parameters each)
+    if korsch_mode:
+        numbers_total = 10  # Fixed for Korsch: 2 mirrors × 5 parameters
+    else:
+        label_cfg = data_cfg.get("label_parsing", {})
+        numbers_total = int(label_cfg.get("numbers_total", data_cfg.get("numbers_total", 11)))
+
+    value_mode = data_cfg.get("value_mode", "mod")
+    ignore_last_number = bool(data_cfg.get("ignore_last_number", True))
+    filename_label_regex = data_cfg.get("filename_label_regex", None)
     normalization_cfg = data_cfg.get("normalization", {})
     augment_cfg = data_cfg.get("augmentations", data_cfg.get("aug_cfg", {}))
     augment_enabled = bool(augment_cfg.get("enabled", True))
-    
-    # Mixup параметры
+
+    # Mixup параметры (disabled for reference mode)
     mixup_cfg = augment_cfg.get("mixup", {})
-    mixup_enabled = bool(mixup_cfg.get("enabled", False))
+    mixup_enabled = bool(mixup_cfg.get("enabled", False)) and not use_reference  # Disable mixup for reference mode
     mixup_alpha = float(mixup_cfg.get("alpha", 0.2))
     mixup_prob = float(mixup_cfg.get("prob", 0.2))
 
-    full_ds = InterferogramDataset(
-        root=root,
-        img_glob=img_glob,
-        image_size=image_size,
-        filename_label_regex=filename_label_regex,
-        numbers_total=numbers_total,
-        bits_per_number=bits_per_number,
-        value_mode=value_mode,
-        ignore_last_number=ignore_last_number,
-        augment=augment_enabled,
-        augmentations=augment_cfg,
-        label_cfg=label_cfg,
-        normalization=normalization_cfg,
-    )
+    # Resolution enhancement configuration
+    resolution_enhancement = data_cfg.get("resolution_enhancement", {})
+    resolution_enhancement_enabled = bool(resolution_enhancement.get("enabled", True))
+    target_resolution = resolution_enhancement.get("target_resolution", None)
+
+    # Create appropriate dataset
+    if use_reference and reference_path:
+        print(f"[INFO] Using reference interferogram mode: {reference_mode}")
+        print(f"[INFO] Reference path: {reference_path}")
+
+        full_ds = ReferenceInterferogramDataset(
+            root=root,
+            img_glob=img_glob,
+            image_size=image_size,
+            korsch_mode=korsch_mode,
+            bits_per_number=bits_per_number,
+            reference_path=reference_path,
+            mode=reference_mode,
+            reference_preprocessing=reference_preprocessing,
+            resolution_enhancement=resolution_enhancement_enabled,
+            target_resolution=target_resolution,
+            enable_augmentations=augment_enabled,
+        )
+        print(f"[INFO] Reference dataset info: {full_ds.get_dataset_info()}")
+
+        ref_info = full_ds.get_reference_info()
+        if ref_info:
+            print(f"[INFO] Reference interferogram info: {ref_info}")
+    else:
+        print("[INFO] Using standard dataset (no reference interferogram)")
+        label_cfg = data_cfg.get("label_parsing", {})
+
+        full_ds = InterferogramDataset(
+            root=root,
+            img_glob=img_glob,
+            image_size=image_size,
+            filename_label_regex=filename_label_regex,
+            numbers_total=numbers_total,
+            bits_per_number=bits_per_number,
+            value_mode=value_mode,
+            ignore_last_number=ignore_last_number,
+            augment=augment_enabled,
+            augmentations=augment_cfg,
+            label_cfg=label_cfg,
+            normalization=normalization_cfg,
+        )
     N = len(full_ds)
     K = full_ds.K
     signature = dataset_signature(full_ds.paths)
@@ -629,6 +753,7 @@ def main():
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
         generator=generator,
+        use_reference=use_reference,
     )
     val_loader = build_dataloader(
         val_ds,
@@ -639,6 +764,7 @@ def main():
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        use_reference=use_reference,
     )
     test_loader = None
     if test_ds is not None and len(test_ds) > 0:
@@ -651,6 +777,7 @@ def main():
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
+            use_reference=use_reference,
         )
 
     model_cfg = cfg.get("model", {})
@@ -666,6 +793,11 @@ def main():
         hidden_dims=model_cfg.get("hidden_dims", None),
         head_dropout=float(model_cfg.get("head_dropout", 0.3)),
         head_norm=model_cfg.get("head_norm", "layernorm"),
+        # Korsch and reference support
+        bits_per_parameter=bits_per_number,
+        use_hybrid_head=bool(model_cfg.get("use_hybrid_head", korsch_mode)),
+        regression_dim=int(model_cfg.get("regression_dim", 10)) if korsch_mode else None,
+        use_reference_input=use_reference,
     )
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -812,23 +944,53 @@ def main():
         num_batches = 0
         skipped_steps = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", ncols=120)
-        for step, (x, y, _, _) in enumerate(pbar):
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            if channels_last:
-                x = x.contiguous(memory_format=torch.channels_last)
-            
-            # Применяем Mixup с вероятностью mixup_prob
-            use_mixup = mixup_enabled and np.random.rand() < mixup_prob
-            if use_mixup:
-                x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha)
-            
-            with autocast_ctx(device_type, use_amp):
-                logits = model(x)
-                if use_mixup:
-                    loss = mixup_criterion(criterion, logits, y_a, y_b, lam) / grad_accum
-                else:
+        for step, batch_data in enumerate(pbar):
+            # Handle different batch formats
+            if use_reference and len(batch_data) == 4:  # (x, y, dual_input, mode_info)
+                x, y, dual_input, mode_info = batch_data
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+
+                if dual_input is not None:
+                    dual_input = dual_input.to(device, non_blocking=True)
+
+                if channels_last:
+                    x = x.contiguous(memory_format=torch.channels_last)
+                    if dual_input is not None:
+                        dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+
+                # No mixup for reference mode
+                with autocast_ctx(device_type, use_amp):
+                    # Model can handle dual input or single input
+                    if dual_input is not None and hasattr(model, 'forward') and 'dual_input' in model.forward.__code__.co_varnames:
+                        logits = model(x, dual_input)
+                    elif dual_input is not None:
+                        # Concatenate dual input if model expects single input
+                        combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
+                        logits = model(combined)
+                    else:
+                        logits = model(x)
+
                     loss = criterion(logits, y) / grad_accum
+            else:
+                # Standard training
+                x, y, _, _ = batch_data
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                if channels_last:
+                    x = x.contiguous(memory_format=torch.channels_last)
+
+                # Применяем Mixup с вероятностью mixup_prob
+                use_mixup = mixup_enabled and np.random.rand() < mixup_prob
+                if use_mixup:
+                    x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha)
+
+                with autocast_ctx(device_type, use_amp):
+                    logits = model(x)
+                    if use_mixup:
+                        loss = mixup_criterion(criterion, logits, y_a, y_b, lam) / grad_accum
+                    else:
+                        loss = criterion(logits, y) / grad_accum
             scaler.scale(loss).backward()
             if (step + 1) % grad_accum == 0:
                 if max_grad_norm > 0:
@@ -862,7 +1024,7 @@ def main():
                 writer.add_scalar("train/skipped_steps", skipped_steps, epoch + 1)
 
         with ema.average_parameters(model):
-            val_metrics = evaluate(model, val_loader, criterion, device, device_type, use_amp, threshold, channels_last)
+            val_metrics = evaluate(model, val_loader, criterion, device, device_type, use_amp, threshold, channels_last, use_reference=use_reference)
 
         print(f"[INFO] Epoch {epoch + 1}: train_loss={train_loss:.4f} | Val {_format_metrics(val_metrics)}")
         if writer and val_metrics:
@@ -935,11 +1097,11 @@ def main():
             ema.load_state_dict(ckpt["ema"])
             ema.copy_to(model)
         with torch.no_grad():
-            final_val = evaluate(model, val_loader, criterion, device, device_type, use_amp, threshold, channels_last)
+            final_val = evaluate(model, val_loader, criterion, device, device_type, use_amp, threshold, channels_last, use_reference=use_reference)
             final_metrics["val_best"] = final_val
             print(f"[RESULT] Best validation metrics: {_format_metrics(final_val)}")
             if test_loader is not None:
-                final_test = evaluate(model, test_loader, criterion, device, device_type, use_amp, threshold, channels_last)
+                final_test = evaluate(model, test_loader, criterion, device, device_type, use_amp, threshold, channels_last, use_reference=use_reference)
                 final_metrics["test"] = final_test
                 print(f"[RESULT] Test metrics: {_format_metrics(final_test)}")
 

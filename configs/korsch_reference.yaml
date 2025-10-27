@@ -1,0 +1,125 @@
+# configs/korsch_reference.yaml — Korsch Training with Reference Interferogram
+# Configuration for training with ideal/reference interferogram for sub-micron precision
+
+# Base configuration
+defaults:
+  - korsch_datasphere
+
+# Reference interferogram settings
+reference_interferogram:
+  enabled: true
+  path: "/home/jupyter/work/datasets/reference_ideal_interferogram.png"
+  mode: "difference"                    # "difference" (current - reference) or "dual_input"
+  preprocessing:
+    normalize_difference: true            # Normalize difference to zero mean, unit std
+    gaussian_blur:
+      enabled: true
+      kernel_size: 1                     # Light blur to reduce noise
+    contrast_enhancement:
+      enabled: false                    # Usually not needed for difference mode
+    brightness_adjustment:
+      enabled: false                    # Usually not needed for difference mode
+
+# Training modifications for reference mode
+data:
+  # Use the enhanced dataset with reference support
+  korsch_mode: true
+  resolution_enhancement:
+    enabled: true                      # Still enhance resolution if needed
+    target_resolution: 1024             # High resolution for sub-micron precision
+    upscaling_method: "adaptive"           # Adaptive method selection
+  # Augmentations should be reduced in reference mode
+  augmentations:
+    enabled: true
+    hflip:
+      enabled: false                     # Don't flip difference data
+      prob: 0.1
+    vflip:
+      enabled: false                     # Don't flip difference data
+      prob: 0.1
+    rotate90:
+      enabled: false                     # Don't rotate difference data
+      prob: 0.0
+    gaussian_noise:
+      enabled: true
+      std: 0.002                         # Very low noise for difference data
+      prob: 0.05
+    random_rotation:
+      enabled: false
+    random_crop:
+      enabled: false
+    color_jitter:
+      enabled: false
+
+# Model adjustments for reference input
+model:
+  # Network configuration for difference input
+  use_reference_input: true              # Enable reference input processing
+  difference_channels: 1                 # Single channel for difference
+  # Enhanced for difference-based learning
+  base_channels: 128                     # Larger for subtle difference features
+  width_multipliers: [2, 4, 8, 16, 32]   # Deeper for difference detection
+  block_repeats: [2, 2, 3, 3, 3]
+  # Optimized for sub-micron precision
+  bits_per_parameter: 8                  # Maximum precision
+  use_hybrid_head: true
+  regression_dim: 10
+  regression_scale_factor: 12.0           # Larger for sub-micron differences
+  head_dropout: 0.1                       # Lower dropout for difference data
+
+# Training parameters optimized for reference learning
+train:
+  epochs: 200                            # Extended training for fine differences
+  batch_size: 512                        # Smaller batch for larger model
+  grad_accum_steps: 2                     # Memory optimization
+  lr: 0.0001                             # Lower learning rate for stability
+  weight_decay: 0.005                       # Very low regularization
+  # Enhanced loss for reference training
+  loss:
+    classification_weight: 0.5              # Lower weight, focus on regression
+    regression_weight: 2.0                # Higher weight for fine differences
+    regression_scale_factor: 16.0           # Large scale for sub-micron precision
+    # Reference-specific loss terms
+    difference_consistency: true             # Enforce consistency with physics
+    fringe_preservation: true                # Preserve interferometric structure
+
+# Scheduler for reference-based training
+train:
+  scheduler:
+    name: "warmup_plateau"
+    warmup_epochs: 15                       # Longer warmup for stable training
+    factor: 0.7                            # Gentle reduction
+    patience: 3
+    min_lr: 1.0e-8
+    metric: "mae_linear_um"               # Track physical precision
+    mode: "min"
+
+# Specialized evaluation for reference mode
+eval:
+  batch_size: 256
+  threshold: 0.3                          # Lower threshold for finer precision
+  # Reference-specific metrics
+  reference_metrics:
+    enabled: true
+    difference_correlation: true            # Correlate differences with displacements
+    symmetry_validation: true               # Check physical constraints
+
+# Logging configuration for reference training
+logging:
+  out_dir: "runs/korsch_reference"
+  project_name: "korsch_reference_training"
+  log_reference_info: true                  # Log reference processing statistics
+  save_difference_examples: true            # Save sample differences for analysis
+
+# DataSphere optimization
+datasphere:
+  reference_memory_mb: 200                 # Extra memory for reference processing
+  use_difference_preprocessing: true         # Preprocess differences on CPU
+  cache_reference_data: true                 # Cache processed reference
+
+# Expected performance with reference
+performance:
+  target_precision_um: 0.5                # < 1 μm with reference
+  target_precision_arcsec: 0.3            # < 1" with reference
+  expected_improvement: "2-3x"           # Expected improvement over absolute
+  training_time_factor: 1.5               # Additional processing time

@@ -71,7 +71,6 @@ class WarmupReduceLROnPlateau:
             threshold_mode=config.threshold_mode,
             cooldown=config.cooldown,
             min_lr=config.min_lr,
-            verbose=False,
         )
 
     @property

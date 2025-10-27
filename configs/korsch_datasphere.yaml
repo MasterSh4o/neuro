@@ -1,5 +1,5 @@
-# configs/korsch_datasphere.yaml — Korsch High-Precision on Yandex DataSphere A100 80GB
-# Optimized for 28 vCPU, 196GB RAM, A100 80GB GPU
+# configs/korsch_datasphere.yaml — Korsch High-Precision (Adapted for 119GB RAM)
+# Optimized for available system with 119GB RAM
 # Target: Sub-micron linear and sub-arcsecond angular precision
 
 # Base configuration extends default.yaml
@@ -14,9 +14,9 @@ data:
   image_size: 512                             # High resolution for precision
 
   loader:
-    workers: 28                               # Full vCPU utilization
+    workers: 16                               # Optimized for 119GB RAM (reduced from 28)
     persistent_workers: true
-    prefetch_factor: 8                          # Large prefetch
+    prefetch_factor: 6                          # Balanced prefetch for 119GB RAM
     pin_memory: true
     drop_last: true
     shuffle: true
@@ -36,12 +36,13 @@ model:
 # Training optimized for long runs
 # DataSphere optimized batch sizes and workers
 train:
-  batch_size: 1024                         # Maximum for A100 80GB
+  batch_size: 768                          # Optimized for 119GB RAM (reduced from 1024)
   grad_accum_steps: 2                         # Memory efficiency
-  epochs: 200                                 # Extended training
-  lr: 0.0001                                # Very low LR
-  weight_decay: 0.005                          # Very low for stability
-  ema_decay: 0.9995                            # Higher EMA for precision
+  epochs: 180                                 # Slightly reduced for 119GB RAM
+  lr: 0.00015                               # Slightly higher LR for smaller batch
+  weight_decay: 0.008                          # Slightly higher for regularization
+  ema_decay: 0.9993                            # Slightly adjusted for 119GB RAM
+  log_every_n_steps: 50                        # Reduced logging frequency for memory
 
   # Precision loss configuration
   loss:
@@ -49,24 +50,46 @@ train:
     regression_weight: 0.5                      # Higher regression weight
     regression_scale_factor: 8.0                 # Larger scale
 
-  # DataSphere scheduler
+  # Optimized scheduler for 119GB RAM with best model tracking
   scheduler:
     name: "warmup_plateau"
-    warmup_epochs: 12
-    factor: 0.3                                 # Aggressive reduction
-    patience: 3
-    cooldown: 1
+    warmup_epochs: 10                           # Slightly reduced warmup
+    factor: 0.4                                 # Less aggressive reduction for smaller batch
+    patience: 4                                 # Increased patience for stability
+    cooldown: 2                                 # Longer cooldown
     min_lr: 1.0e-7
-    metric: "mae_linear_um"
+    metric: "mae_linear_um"                     # Same as best_metric for consistency
+    mode: "min"                                 # Lower is better
 
-# Logging paths relative to workspace
+  # Early stopping for best model
+  early_stopping:
+    enabled: true
+    patience: 15                                # Stop if no improvement for 15 epochs
+    metric: "mae_linear_um"                     # Same metric as best model
+    mode: "min"
+    restore_best_weights: true                  # Restore best model when stopping
+
+  # Memory-optimized tensorboard settings
+  tensorboard:
+    enabled: true
+    log_dir: "runs/tensorboard_119gb"
+    flush_secs: 120                              # Less frequent flushing (was default)
+    max_queue: 5                                 # Smaller queue size
+
+# Logging paths relative to workspace - Best model only
 logging:
-  out_dir: "runs/korsch_high_precision"
-  project_name: "korsch_interferometer"
-  save_every: 5
-  keep_last_k: 10
-  dump_config: true
-  env_report: true
+  out_dir: "runs/korsch_high_precision_119gb"
+  project_name: "korsch_interferometer_119gb"
+  save_every: 1                                  # Check every epoch for best model
+  keep_last_k: 1                                 # Keep ONLY the best model
+  save_best_only: true                           # Save only when metric improves
+  best_metric: "mae_linear_um"                   # Metric to monitor for best model
+  best_mode: "min"                               # Lower is better for MAE
+  dump_config: false                             # Skip config dumping to save space
+  env_report: false                              # Skip environment reporting
+  # Additional memory-saving options
+  log_images: false                              # Disable image logging
+  log_model_graph: false                         # Skip model graph logging
 
 # Checkpointing with DataSphere paths
 checkpoint:
@@ -79,11 +102,11 @@ torch_compile: false
 
 # Testing configuration
 testing:
-  smoke_samples: 100                          # Extended smoke test
+  smoke_samples: 80                           # Adjusted for 119GB RAM
 
-# DataSphere specific settings
-datasphere:
-  max_gpu_memory_gb: 80                       # Full A100 capacity
+# System settings optimized for 119GB RAM
+system:
+  max_memory_gb: 119                          # System RAM capacity
   use_distributed: false                       # Single GPU mode
   mixed_precision: true
   gradient_checkpointing: true                  # Memory optimization
