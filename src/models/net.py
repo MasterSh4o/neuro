@@ -128,6 +128,9 @@ class InterferoNetMultiLabel(nn.Module):
         # Параметры для повышения точности
         use_hybrid_head: bool = False,  # Гибрид: классификация + регрессия
         regression_dim: int = 10,       # Количество регрессионных выходов
+        # Параметры для Korsch кодирования и эталонных интерферограмм
+        bits_per_parameter: int = 7,    # Битов на параметр для Korsch кодирования
+        use_reference_input: bool = False,  # Использование эталонной интерферограммы как входа
     ):
         super().__init__()
         width_multipliers = tuple(width_multipliers)
@@ -138,10 +141,14 @@ class InterferoNetMultiLabel(nn.Module):
         self.base_channels = base_channels
         self.use_hybrid_head = use_hybrid_head
         self.regression_dim = regression_dim
+        self.bits_per_parameter = bits_per_parameter
+        self.use_reference_input = use_reference_input
 
         stem_channels = base_channels
+        # Адаптируем входной слой для эталонных интерферограмм
+        input_channels = 2 if use_reference_input else 1
         self.stem = nn.Sequential(
-            nn.Conv2d(1, stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv2d(input_channels, stem_channels, kernel_size=7, stride=2, padding=3, bias=False),
             _make_norm(norm_type, stem_channels, gn_groups),
             nn.ReLU(inplace=True),
         )
