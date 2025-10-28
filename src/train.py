@@ -62,34 +62,75 @@ def reference_collate_fn(batch):
     """Collate function for reference interferogram datasets."""
     import torch as _T
 
-    # Handle different return formats from dataset
-    if len(batch[0]) == 3:  # (img, diff_or_label, mode_info)
-        xs, second_inputs, mode_infos = zip(*batch)
+    def _ensure_nchw(tensor: _T.Tensor) -> _T.Tensor:
+        """Make sure a batched tensor follows [N, C, H, W] layout when possible."""
+        if tensor.dim() == 5 and tensor.size(1) == 1:
+            tensor = tensor.squeeze(1)
+        elif tensor.dim() == 3:
+            tensor = tensor.unsqueeze(1)
+        return tensor
 
-        # Check if we're in dual_input mode (second_input is tensor) or difference mode (second_input is label)
-        if isinstance(second_inputs[0], _T.Tensor):
-            # Dual input mode: (img, dual_input, mode_info)
-            x = _T.stack(xs, dim=0)  # [B, 1, H, W] or [B, 2, H, W]
-            y = None  # Labels extracted from mode_info
-            dual_input = _T.stack(second_inputs, dim=0)
-        else:
-            # Difference mode or labels included: (img, label, mode_info)
-            x = _T.stack(xs, dim=0)
-            y = _T.stack([_T.from_numpy(np.array(si)) if si is not None else _T.zeros(80)
-                          for si in second_inputs], dim=0).float()
+    def _to_label_tensor(item: Any, fallback_dim: int = 80) -> _T.Tensor:
+        if isinstance(item, _T.Tensor):
+            return item.float()
+        if item is None:
+            return _T.zeros(fallback_dim, dtype=_T.float32)
+        return _T.from_numpy(np.asarray(item)).float()
+
+    # Handle different return formats from dataset
+    if len(batch[0]) == 3:  # (img, diff_or_dual_or_label, mode_info)
+        xs, second_inputs, mode_infos = zip(*batch)
+        mode_infos = [mi or {} for mi in mode_infos]
+
+        x = _T.stack(xs, dim=0).float()
+        x = _ensure_nchw(x)
+
+        first_second = second_inputs[0]
+        is_tensor = isinstance(first_second, _T.Tensor)
+        treat_as_image = is_tensor and first_second.dim() >= 3
+
+        dual_input = None
+        y = None
+
+        if treat_as_image:
+            stacked = _T.stack([si.float() for si in second_inputs], dim=0)
+            stacked = _ensure_nchw(stacked)
+            if stacked.dim() == 4:
+                dual_input = stacked
+            else:
+                # Fall back to treating the secondary input as labels if shape is unexpected
+                treat_as_image = False
+
+        if not treat_as_image:
+            # Interpret secondary input as labels or label-like tensors
+            label_dim = int(mode_infos[0].get('label_dim', 80)) if mode_infos else 80
+            y = _T.stack([_to_label_tensor(si, label_dim) for si in second_inputs], dim=0)
             dual_input = None
     else:
         # Standard format: (x, y, side, rels)
         xs, ys, sides, rels = zip(*batch)
-        x = _T.stack(xs, dim=0)
+        x = _T.stack(xs, dim=0).float()
+        x = _ensure_nchw(x)
         y = _T.stack(ys, dim=0).float()
         dual_input = None
-        mode_infos = rels
+        mode_infos = [ri or {} for ri in rels]
 
-    # Extract labels from mode_info if needed
+    # Extract labels from mode_info if they were not supplied directly
     if y is None and mode_infos:
-        y = _T.stack([_T.from_numpy(np.array(mode_info.get('label', np.zeros(80))))
-                     for mode_info in mode_infos], dim=0).float()
+        extracted_labels: list[_T.Tensor] = []
+        label_dim = int(mode_infos[0].get('label_dim', 80)) if mode_infos else 80
+        for mode_info in mode_infos:
+            label = mode_info.get('label') if mode_info else None
+            if label is None:
+                extracted_labels = []
+                break
+            extracted_labels.append(_to_label_tensor(label, label_dim))
+
+        if extracted_labels:
+            y = _T.stack(extracted_labels, dim=0)
+        else:
+            # Fallback to zeros if labels are completely unavailable to keep pipeline running
+            y = _T.zeros(x.size(0), label_dim, dtype=_T.float32)
 
     return x, y, dual_input, mode_infos
 

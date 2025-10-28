@@ -535,7 +535,8 @@ class ReferenceInterferogramDataset(Dataset):
 
         # Преобразование в тензор
         img_tensor = torch.from_numpy(img).float().unsqueeze(0)  # [1, H, W]
-        label_tensor = torch.from_numpy(self.labels[idx]).float()
+        label_array = self.labels[idx].astype(np.float32, copy=False)
+        label_tensor = torch.from_numpy(label_array).float()
 
         # Обработка с эталонной интерферограммой
         mode_info = {
@@ -543,6 +544,8 @@ class ReferenceInterferogramDataset(Dataset):
             'has_reference': self.reference_processor is not None,
             'reference_path': self.reference_path,
             'image_path': self.paths[idx],
+            'label': label_array,
+            'label_dim': int(label_array.shape[0]),
         }
 
         if self.mode == "difference" and self.reference_processor is not None:
@@ -551,7 +554,6 @@ class ReferenceInterferogramDataset(Dataset):
 
             # Преобразование в тензор с правильной размерностью для consistency
             difference_tensor = torch.from_numpy(difference).float().unsqueeze(0)  # [1, H, W]
-            difference_tensor = difference_tensor.unsqueeze(0)  # [1, 1, H, W] - batch dimension для consistency
 
             return img_tensor, difference_tensor, mode_info
 
@@ -561,9 +563,8 @@ class ReferenceInterferogramDataset(Dataset):
 
             # Преобразование в тензор с правильной размерностью для channels_last
             dual_tensor = torch.from_numpy(dual_input).float()  # [2, H, W]
-            dual_tensor = dual_tensor.unsqueeze(0)  # [1, 2, H, W] - batch dimension для consistency
 
-            return dual_tensor, label_tensor, mode_info
+            return img_tensor, dual_tensor, mode_info
 
         else:
             # Стандартный режим
