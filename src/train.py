@@ -77,6 +77,15 @@ def reference_collate_fn(batch):
             return _T.zeros(fallback_dim, dtype=_T.float32)
         return _T.from_numpy(np.asarray(item)).float()
 
+    def _stack_labels(items: Sequence[Any], label_dim: int) -> _T.Tensor:
+        tensors: list[_T.Tensor] = []
+        for value in items:
+            tensor = _to_label_tensor(value, label_dim)
+            if tensor.dim() == 0:
+                tensor = tensor.unsqueeze(0)
+            tensors.append(tensor)
+        return _T.stack(tensors, dim=0)
+
     # Handle different return formats from dataset
     if len(batch[0]) == 3:  # (img, diff_or_dual_or_label, mode_info)
         xs, second_inputs, mode_infos = zip(*batch)
@@ -85,12 +94,14 @@ def reference_collate_fn(batch):
         x = _T.stack(xs, dim=0).float()
         x = _ensure_nchw(x)
 
+        label_dim = int(mode_infos[0].get('label_dim', 80)) if mode_infos else 80
+
         first_second = second_inputs[0]
         is_tensor = isinstance(first_second, _T.Tensor)
         treat_as_image = is_tensor and first_second.dim() >= 3
 
         dual_input = None
-        y = None
+        y: Optional[_T.Tensor] = None
 
         if treat_as_image:
             stacked = _T.stack([si.float() for si in second_inputs], dim=0)
@@ -103,22 +114,22 @@ def reference_collate_fn(batch):
 
         if not treat_as_image:
             # Interpret secondary input as labels or label-like tensors
-            label_dim = int(mode_infos[0].get('label_dim', 80)) if mode_infos else 80
-            y = _T.stack([_to_label_tensor(si, label_dim) for si in second_inputs], dim=0)
+            y = _stack_labels(second_inputs, label_dim)
             dual_input = None
     else:
         # Standard format: (x, y, side, rels)
         xs, ys, sides, rels = zip(*batch)
         x = _T.stack(xs, dim=0).float()
         x = _ensure_nchw(x)
-        y = _T.stack(ys, dim=0).float()
-        dual_input = None
         mode_infos = [ri or {} for ri in rels]
+        label_dim = int(mode_infos[0].get('label_dim', 80)) if mode_infos else 80
+        y = _stack_labels(ys, label_dim)
+        dual_input = None
 
     # Extract labels from mode_info if they were not supplied directly
-    if y is None and mode_infos:
-        extracted_labels: list[_T.Tensor] = []
+    if (y is None or not isinstance(y, _T.Tensor)) and mode_infos:
         label_dim = int(mode_infos[0].get('label_dim', 80)) if mode_infos else 80
+        extracted_labels: list[_T.Tensor] = []
         for mode_info in mode_infos:
             label = mode_info.get('label') if mode_info else None
             if label is None:
@@ -128,11 +139,64 @@ def reference_collate_fn(batch):
 
         if extracted_labels:
             y = _T.stack(extracted_labels, dim=0)
-        else:
-            # Fallback to zeros if labels are completely unavailable to keep pipeline running
-            y = _T.zeros(x.size(0), label_dim, dtype=_T.float32)
 
-    return x, y, dual_input, mode_infos
+    if y is None or not isinstance(y, _T.Tensor):
+        label_dim = int(mode_infos[0].get('label_dim', 80)) if mode_infos else 80
+        y = _T.zeros(x.size(0), label_dim, dtype=_T.float32)
+
+    return x, y.float(), dual_input, mode_infos
+
+
+def _ensure_batch_labels(
+    labels: Any,
+    batch_size: int,
+    mode_infos: Optional[Sequence[Dict[str, Any]]] = None,
+    default_dim: int = 80,
+) -> torch.Tensor:
+    """Convert labels coming from a dataloader into a float tensor batch."""
+
+    label_dim = default_dim
+    if mode_infos:
+        try:
+            inferred = int(mode_infos[0].get("label_dim", label_dim))
+            if inferred > 0:
+                label_dim = inferred
+        except Exception:
+            pass
+
+    def _coerce_single(item: Any) -> torch.Tensor:
+        if isinstance(item, torch.Tensor):
+            tensor = item.float()
+        else:
+            tensor = torch.from_numpy(np.asarray(item)).float()
+        if tensor.dim() == 0:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
+    if isinstance(labels, torch.Tensor):
+        tensor = labels.float()
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
+    if isinstance(labels, (list, tuple)):
+        tensors = [_coerce_single(item) for item in labels if item is not None]
+        if tensors:
+            # Ensure consistent shape across stacked tensors
+            base_shape = tensors[0].shape
+            tensors = [
+                t.view(base_shape) if t.shape != base_shape else t for t in tensors
+            ]
+            stacked = torch.stack(tensors, dim=0)
+            return stacked.float()
+        return torch.zeros(batch_size, label_dim, dtype=torch.float32)
+
+    tensor = _coerce_single(labels)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    if tensor.size(0) != batch_size:
+        tensor = tensor.expand(batch_size, -1)
+    return tensor.float()
 
 
 def mixup_data(x, y, alpha=0.2):
@@ -486,6 +550,7 @@ def evaluate(
         for batch_data in loader:
             if use_reference and len(batch_data) == 4:  # (x, y, dual_input, mode_info)
                 x, y, dual_input, mode_info = batch_data
+                y = _ensure_batch_labels(y, x.size(0), mode_info)
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
@@ -526,7 +591,8 @@ def evaluate(
                     loss = criterion(logits, y)
             else:
                 # Standard evaluation
-                x, y, _, _ = batch_data
+                x, y, _, rels = batch_data
+                y = _ensure_batch_labels(y, x.size(0), rels)
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 if channels_last:
@@ -1022,6 +1088,7 @@ def main():
             # Handle different batch formats
             if use_reference and len(batch_data) == 4:  # (x, y, dual_input, mode_info)
                 x, y, dual_input, mode_info = batch_data
+                y = _ensure_batch_labels(y, x.size(0), mode_info)
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
@@ -1064,7 +1131,8 @@ def main():
                     loss = criterion(logits, y) / grad_accum
             else:
                 # Standard training
-                x, y, _, _ = batch_data
+                x, y, _, rels = batch_data
+                y = _ensure_batch_labels(y, x.size(0), rels)
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 if channels_last:
