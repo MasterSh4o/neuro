@@ -1,0 +1,96 @@
+# Minimal debug configuration for testing
+# Use this when other config files cause KeyError: 'batch_size'
+
+seed: 42
+device: cuda  # or cpu
+precision: amp
+channels_last: true
+torch_compile: false
+
+# Data configuration
+data:
+  root: "sample_interferograms"  # Create this directory with some test images
+  img_glob: "**/*.png,**/*.jpg,**/*.tif"
+  image_size: 256
+  korsch_mode: true
+  bits_per_number: 5
+  linear_range_um: 1000.0
+  angular_range_arcsec: 60.0
+
+  # Reference interferogram (optional)
+  reference_interferogram:
+    enabled: false
+    mode: "difference"
+
+  # Minimal augmentations
+  augmentations:
+    enabled: false
+
+  # DataLoader configuration
+  loader:
+    workers: 0
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: false
+
+# Model configuration
+model:
+  out_dim: 50  # Will be calculated automatically based on K
+  base_channels: 32
+  width_multipliers: [2, 4, 8]
+  block_repeats: [1, 1, 1]
+  norm: "groupnorm"
+  gn_groups: 16
+  dropout: 0.1
+  head_dropout: 0.1
+  bits_per_parameter: 7
+  use_hybrid_head: false
+  regression_dim: null
+  use_reference_input: false
+
+# Training configuration - THIS IS THE CRITICAL SECTION
+train:
+  epochs: 5
+  batch_size: 8
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+  ema_decay: 0.999
+  bce_pos_weight: "auto"
+  loss_reduction: "mean"
+  log_every_n_steps: 10
+  early_stopping_patience: 3
+
+  # Simple scheduler
+  scheduler:
+    name: "cosine_warmup"
+    warmup_epochs: 1
+    min_lr: 0.00001
+
+# Evaluation configuration
+eval:
+  batch_size: 16
+  threshold: 0.5
+
+# Data split
+split:
+  train_ratio: 0.8
+  val_ratio: 0.2
+  test_ratio: 0.0
+  stratified: false
+
+# Logging
+logging:
+  out_dir: "runs/minimal_debug"
+  project_name: "minimal_debug"
+  dump_config: true
+  save_every: 1
+  keep_last_k: 2
+
+# Empty sections
+checkpoint:
+  path: null
+
+testing:
+  smoke_samples: 4

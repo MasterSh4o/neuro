@@ -452,9 +452,24 @@ def evaluate(
                     dual_input = dual_input.to(device, non_blocking=True)
 
                 if channels_last:
-                    x = x.contiguous(memory_format=torch.channels_last)
+                    # Применяем channels_last только к 4D тензорам [N, C, H, W]
+                    if x.dim() == 4:
+                        x = x.contiguous(memory_format=torch.channels_last)
+                    else:
+                        print(f"[WARN EVAL] Unexpected x tensor shape: {x.shape}, expected 4D for channels_last")
+
                     if dual_input is not None:
-                        dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                        if dual_input.dim() == 4:
+                            dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                        else:
+                            print(f"[WARN EVAL] Unexpected dual_input tensor shape: {dual_input.shape}, expected 4D for channels_last")
+                            # Попробуем исправить размерность если возможно
+                            if dual_input.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+                                dual_input = dual_input.unsqueeze(0)
+                                print(f"[DEBUG EVAL] Added batch dimension to dual_input: {dual_input.shape}")
+                                if dual_input.dim() == 4:
+                                    dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                                    print(f"[DEBUG EVAL] Successfully applied channels_last to fixed dual_input")
 
                 with autocast_ctx(device_type, use_amp):
                     # Model can handle dual input or single input
@@ -742,7 +757,19 @@ def main():
         persistent_workers = False
         prefetch_factor = None
 
-    train_batch_size = int(cfg["train"]["batch_size"])
+    # Get training configuration with error handling
+    train_cfg = cfg.get("train", {})
+    if not train_cfg:
+        raise KeyError(
+            "Missing 'train' section in config. Please add a 'train' section with at least:\n"
+            "train:\n"
+            "  batch_size: 8\n"
+            "  epochs: 5\n"
+            "  lr: 0.001\n"
+            "Example: python src/train.py --config configs/debug_config.yaml"
+        )
+
+    train_batch_size = int(train_cfg.get("batch_size", 32))
     eval_cfg = cfg.get("eval", {})
     eval_batch_size = int(eval_cfg.get("batch_size", train_batch_size))
 
@@ -814,11 +841,11 @@ def main():
         except Exception as exc:  # pragma: no cover
             print(f"[WARN] torch.compile failed, continuing without compilation: {exc}")
 
-    train_cfg = cfg["train"]
+    # Use train_cfg already defined above with error handling
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(train_cfg["lr"]),
-        weight_decay=float(train_cfg["weight_decay"]),
+        lr=float(train_cfg.get("lr", 0.001)),
+        weight_decay=float(train_cfg.get("weight_decay", 0.0001)),
         betas=tuple(train_cfg.get("betas", (0.9, 0.999))),
     )
     scheduler_cfg = train_cfg.get("scheduler", {})
@@ -837,7 +864,7 @@ def main():
                 mode=scheduler_cfg.get("mode", "max"),
                 metric=scheduler_cfg.get("metric", "f1_micro"),
             ),
-            base_lrs=[train_cfg["lr"]],
+            base_lrs=[train_cfg.get("lr", 0.001)],
         )
     else:
         scheduler = CosineWarmupLR(
@@ -961,9 +988,25 @@ def main():
                     dual_input = dual_input.to(device, non_blocking=True)
 
                 if channels_last:
-                    x = x.contiguous(memory_format=torch.channels_last)
+                    # Применяем channels_last только к 4D тензорам [N, C, H, W]
+                    if x.dim() == 4:
+                        x = x.contiguous(memory_format=torch.channels_last)
+                    else:
+                        print(f"[WARN] Unexpected x tensor shape: {x.shape}, expected 4D for channels_last")
+
                     if dual_input is not None:
-                        dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                        if dual_input.dim() == 4:
+                            dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                        else:
+                            print(f"[WARN] Unexpected dual_input tensor shape: {dual_input.shape}, expected 4D for channels_last")
+                            print(f"[DEBUG] dual_input dtype: {dual_input.dtype}, device: {dual_input.device}")
+                            # Попробуем исправить размерность если возможно
+                            if dual_input.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+                                dual_input = dual_input.unsqueeze(0)
+                                print(f"[DEBUG] Added batch dimension to dual_input: {dual_input.shape}")
+                                if dual_input.dim() == 4:
+                                    dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                                    print(f"[DEBUG] Successfully applied channels_last to fixed dual_input")
 
                 # No mixup for reference mode
                 with autocast_ctx(device_type, use_amp):

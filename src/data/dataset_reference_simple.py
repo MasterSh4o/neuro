@@ -549,8 +549,9 @@ class ReferenceInterferogramDataset(Dataset):
             # Вычисление разности
             difference = self.reference_processor.compute_difference(current_img)
 
-            # Преобразование в тензор
+            # Преобразование в тензор с правильной размерностью для consistency
             difference_tensor = torch.from_numpy(difference).float().unsqueeze(0)  # [1, H, W]
+            difference_tensor = difference_tensor.unsqueeze(0)  # [1, 1, H, W] - batch dimension для consistency
 
             return img_tensor, difference_tensor, mode_info
 
@@ -558,8 +559,9 @@ class ReferenceInterferogramDataset(Dataset):
             # Создание двойного входа
             dual_input = self.reference_processor.create_dual_input(current_img)
 
-            # Преобразование в тензор
+            # Преобразование в тензор с правильной размерностью для channels_last
             dual_tensor = torch.from_numpy(dual_input).float()  # [2, H, W]
+            dual_tensor = dual_tensor.unsqueeze(0)  # [1, 2, H, W] - batch dimension для consistency
 
             return dual_tensor, label_tensor, mode_info
 
