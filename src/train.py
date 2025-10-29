@@ -773,7 +773,7 @@ def main():
     image_size = int(data_cfg.get("image_size", 256))
 
     # Check for reference interferogram configuration
-    reference_cfg = cfg.get("reference_interferogram", {})
+    reference_cfg = cfg.get("reference_interferogram") or data_cfg.get("reference_interferogram", {})
     use_reference = bool(reference_cfg.get("enabled", False))
     reference_mode = reference_cfg.get("mode", "difference")  # "difference", "dual_input", or "normal"
     reference_path = reference_cfg.get("path", None) if use_reference else None
