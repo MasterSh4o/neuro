@@ -115,7 +115,7 @@ logging:
   env_report: true
 
 checkpoint:
-  path: null
+  path: "runs/checkpoints"
 
 datasphere:
   machine: "g2.1"
