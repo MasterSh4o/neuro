@@ -375,7 +375,7 @@ class InterferogramDataset(Dataset):
         else:
             # Sanitize patterns
             raw_patterns = str(img_glob).replace(";", ",").split(",")
-            patterns = [sanitize_path(p.strip()) for p in raw_patterns if p.strip()]
+            patterns = [sanitize_path(p.strip(), allow_wildcards=True) for p in raw_patterns if p.strip()]
 
             discovered: list[str] = []
             for pat in patterns:
@@ -769,4 +769,3 @@ class InterferogramDataset(Dataset):
         y = torch.from_numpy(self.labels[idx]).float()
         side = None
         return x, y, side, rel_path
-

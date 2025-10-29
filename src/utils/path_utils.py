@@ -179,18 +179,21 @@ def ensure_directory(path: str, permissions: Optional[int] = None) -> str:
 
     return str(resolved_path)
 
-def sanitize_path(path: str) -> str:
+def sanitize_path(path: str, allow_wildcards: bool = False) -> str:
     """
     Sanitize path string for security.
 
     Args:
         path (str): Path to sanitize
+        allow_wildcards (bool): Preserve glob wildcards (*, ?) if True
 
     Returns:
         str: Sanitized path
     """
     # Remove dangerous characters
     dangerous_chars = ['<', '>', ':', '"', '|', '?', '*']
+    if allow_wildcards:
+        dangerous_chars = [ch for ch in dangerous_chars if ch not in {'*', '?'}]
     sanitized = path
 
     for char in dangerous_chars:
