@@ -1,0 +1,129 @@
+# configs/datasphere_g21_dual.yaml — Yandex DataSphere g2.1 dual-input training setup
+
+seed: 42
+device: cuda
+precision: amp                   # mixed precision fits A100 80GB
+channels_last: true
+torch_compile: false
+
+model:
+  base_channels: 80
+  width_multipliers: [2, 4, 8, 12, 16]
+  block_repeats: [2, 2, 3, 3, 3]
+  norm: groupnorm
+  gn_groups: 16
+  stochastic_depth: 0.1
+  dropout: 0.2
+
+  out_dim: 50                     # 10 displacements × 5 bits each
+  bits_per_parameter: 5
+  use_reference_input: true
+  use_hybrid_head: true
+  regression_dim: 10
+  head_dropout: 0.2
+  head_norm: "layernorm"
+  hidden_dims: [3072, 1536, 768]
+
+data:
+  root: "../../datasets/dual_input_interferograms"
+  img_glob: "**/*.png,**/*.jpg,**/*.tif,**/*.bmp"
+  image_size: 512
+
+  reference_interferogram:
+    enabled: true
+    path: "../../datasets/dual_input_interferograms/reference/ideal.bmp"
+    mode: "dual"
+    preprocessing:
+      normalize_difference: true
+      gaussian_blur:
+        enabled: true
+        kernel_size: 1
+
+  resolution_enhancement:
+    enabled: true
+    target_resolution: 1024
+    preserve_fringes: true
+    analysis_threshold: 0.8
+    upscaling_method: "adaptive"
+
+  label_parsing:
+    numbers_total: 11
+    ignore_last_number: true
+    bits_per_number: 5
+    value_mode: "mod"
+
+  loader:
+    workers: 24                   # g2.1 has 28 vCPUs, leave headroom
+    persistent_workers: true
+    prefetch_factor: 8
+    pin_memory: true
+    drop_last: true
+    shuffle: true
+
+split:
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+  stratified: true
+  max_val_samples: 30000
+  cache_dir: "runs/splits"
+  reuse_cached: true
+
+train:
+  epochs: 160
+  batch_size: 768                 # empirically safe for A100 80GB with dual input
+  grad_accum_steps: 2
+  lr: 0.00018
+  weight_decay: 0.008
+  betas: [0.9, 0.999]
+  ema_decay: 0.9993
+  max_grad_norm: 1.0
+  log_every_n_steps: 40
+  early_stopping_patience: 20
+
+  loss:
+    classification_weight: 1.0
+    regression_weight: 0.6
+    regression_scale_factor: 8.0
+
+  scheduler:
+    name: "warmup_plateau"
+    warmup_epochs: 12
+    factor: 0.45
+    patience: 4
+    cooldown: 2
+    min_lr: 5.0e-7
+    metric: "mae_linear_um"
+    mode: "min"
+
+  tensorboard:
+    enabled: true
+    log_dir: "runs/tensorboard_g21_dual"
+
+eval:
+  threshold: 0.45
+  batch_size: 384
+  metrics_output: "runs/metrics_g21_dual"
+
+logging:
+  out_dir: "runs"
+  project_name: "datasphere_g21_dual"
+  run_name: null
+  save_every: 1
+  keep_last_k: 3
+  dump_config: true
+  env_report: true
+
+checkpoint:
+  path: null
+
+datasphere:
+  machine: "g2.1"
+  dataset_size: 300000
+  notes: "Dual-input (current + reference). Ensure dataset cached on NVMe for throughput."
+
+performance:
+  expected_epoch_minutes: 13
+  expected_total_hours: 35
+  checkpoint_size_mb: 647          # ~fp32 state_dict (169.6M params)
+  checkpoint_size_fp16_mb: 323     # ~mixed precision weights

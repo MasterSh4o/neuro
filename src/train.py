@@ -135,6 +135,82 @@ def reference_collate_fn(batch):
     return x, y, dual_input, mode_infos
 
 
+def _unpack_model_output(output):
+    """
+    Normalize model outputs to (classification_logits, regression_output).
+    Returns (tensor, None) if the model does not produce regression outputs.
+    """
+    if isinstance(output, tuple):
+        if len(output) == 2:
+            return output
+        if len(output) == 1:
+            return output[0], None
+        classification = output[0]
+        regression = output[1] if len(output) > 1 else None
+        return classification, regression
+    return output, None
+
+
+def _build_regression_targets(
+    label_bits: torch.Tensor,
+    *,
+    regression_dim: Optional[int],
+    bits_per_param: Optional[int],
+    scale_factor: float = 1.0,
+    mode_info: Optional[Sequence[dict]] = None,
+) -> Optional[torch.Tensor]:
+    """
+    Construct regression targets for the hybrid head.
+
+    Priority:
+      1. Use explicit regression targets from mode_info if available.
+      2. Derive normalized targets from classification bits.
+    """
+    if regression_dim is None or regression_dim <= 0:
+        return None
+
+    device = label_bits.device
+    dtype = label_bits.dtype
+
+    if mode_info:
+        collected: list[torch.Tensor] = []
+        for info in mode_info:
+            if not info:
+                collected = []
+                break
+            target = info.get("regression_target")
+            if target is None:
+                collected = []
+                break
+            collected.append(torch.as_tensor(target, dtype=dtype, device=device))
+        if collected:
+            stacked = torch.stack(collected, dim=0)
+            if stacked.shape[1] == regression_dim:
+                return stacked
+
+    if bits_per_param is None or bits_per_param <= 0:
+        return None
+
+    total_bits_needed = regression_dim * bits_per_param
+    if label_bits.shape[1] < total_bits_needed:
+        return None
+
+    bits_view = label_bits[:, :total_bits_needed].contiguous().view(label_bits.size(0), regression_dim, bits_per_param)
+    bit_powers = (1 << torch.arange(bits_per_param, device=device)).to(dtype).view(1, 1, -1)
+    discrete_values = (bits_view * bit_powers).sum(dim=2)
+
+    levels = float(1 << bits_per_param)
+    midpoint = (levels - 1.0) * 0.5
+    if midpoint > 0:
+        normalized = (discrete_values - midpoint) / midpoint
+    else:
+        normalized = torch.zeros_like(discrete_values, dtype=dtype, device=device)
+
+    if scale_factor != 0:
+        normalized = normalized / float(scale_factor)
+    return normalized.to(dtype)
+
+
 def mixup_data(x, y, alpha=0.2):
     """Реализация Mixup регуляризации"""
     if alpha > 0:
@@ -472,75 +548,110 @@ def evaluate(
     use_amp: bool,
     threshold: float,
     channels_last: bool,
+    *,
     use_reference: bool = False,
+    classification_weight: float = 1.0,
+    regression_criterion: Optional[nn.Module] = None,
+    regression_weight: float = 0.0,
+    bits_per_param: Optional[int] = None,
+    regression_dim: Optional[int] = None,
+    regression_scale_factor: float = 1.0,
+    warn_if_missing: bool = False,
 ) -> Dict[str, Any]:
     if loader is None:
         return {}
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    num_classes = getattr(loader.dataset, "K", 80)  # Default to 80 for Korsch reference
+    cls_loss_total = 0.0
+    reg_loss_total = 0.0
+    regression_samples = 0
+    regression_active = bool(regression_weight > 0 and regression_criterion is not None)
+    regression_missing_warned = False
+    num_classes = getattr(loader.dataset, "K", 80)
     meter = MultilabelMetrics(num_classes=num_classes, threshold=threshold, device=device)
 
     with torch.no_grad():
         for batch_data in loader:
-            if use_reference and len(batch_data) == 4:  # (x, y, dual_input, mode_info)
+            mode_info = None
+            dual_input = None
+            if use_reference and len(batch_data) == 4:
                 x, y, dual_input, mode_info = batch_data
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
-
                 if dual_input is not None:
                     dual_input = dual_input.to(device, non_blocking=True)
-
                 if channels_last:
-                    # Применяем channels_last только к 4D тензорам [N, C, H, W]
                     if x.dim() == 4:
                         x = x.contiguous(memory_format=torch.channels_last)
                     else:
                         print(f"[WARN EVAL] Unexpected x tensor shape: {x.shape}, expected 4D for channels_last")
-
                     if dual_input is not None:
                         if dual_input.dim() == 4:
                             dual_input = dual_input.contiguous(memory_format=torch.channels_last)
-                        else:
+                        elif dual_input.dim() == 3:
+                            dual_input = dual_input.unsqueeze(0)
+                            if dual_input.dim() == 4:
+                                dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                        elif warn_if_missing and not regression_missing_warned:
                             print(f"[WARN EVAL] Unexpected dual_input tensor shape: {dual_input.shape}, expected 4D for channels_last")
-                            # Попробуем исправить размерность если возможно
-                            if dual_input.dim() == 3:  # [C, H, W] -> [1, C, H, W]
-                                dual_input = dual_input.unsqueeze(0)
-                                print(f"[DEBUG EVAL] Added batch dimension to dual_input: {dual_input.shape}")
-                                if dual_input.dim() == 4:
-                                    dual_input = dual_input.contiguous(memory_format=torch.channels_last)
-                                    print(f"[DEBUG EVAL] Successfully applied channels_last to fixed dual_input")
-
-                with autocast_ctx(device_type, use_amp):
-                    # Model can handle dual input or single input
-                    if dual_input is not None and hasattr(model, 'forward') and 'dual_input' in model.forward.__code__.co_varnames:
-                        logits = model(x, dual_input)
-                    elif dual_input is not None:
-                        # Concatenate dual input if model expects single input
-                        combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
-                        logits = model(combined)
-                    else:
-                        logits = model(x)
-
-                    loss = criterion(logits, y)
             else:
-                # Standard evaluation
                 x, y, _, _ = batch_data
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 if channels_last:
                     x = x.contiguous(memory_format=torch.channels_last)
-                with autocast_ctx(device_type, use_amp):
-                    logits = model(x)
-                    loss = criterion(logits, y)
 
-            total_loss += float(loss.item()) * y.size(0)
-            total_samples += y.size(0)
+            with autocast_ctx(device_type, use_amp):
+                if dual_input is not None:
+                    if hasattr(model, "forward") and "dual_input" in model.forward.__code__.co_varnames:
+                        outputs = model(x, dual_input)
+                    else:
+                        combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
+                        outputs = model(combined)
+                else:
+                    outputs = model(x)
+
+                logits, reg_out = _unpack_model_output(outputs)
+                cls_loss = criterion(logits, y)
+                batch_total_loss = classification_weight * cls_loss
+                reg_loss = None
+
+                if regression_active:
+                    if reg_out is None:
+                        if warn_if_missing and not regression_missing_warned:
+                            print("[WARN EVAL] Regression outputs unavailable; skipping regression component.")
+                            regression_missing_warned = True
+                    else:
+                        reg_target = _build_regression_targets(
+                            y,
+                            regression_dim=regression_dim,
+                            bits_per_param=bits_per_param,
+                            scale_factor=regression_scale_factor,
+                            mode_info=mode_info,
+                        )
+                        if reg_target is not None:
+                            reg_target = reg_target.to(reg_out.device, dtype=reg_out.dtype)
+                            reg_loss = regression_criterion(reg_out, reg_target)
+                            batch_total_loss = batch_total_loss + regression_weight * reg_loss
+                        elif warn_if_missing and not regression_missing_warned:
+                            print("[WARN EVAL] Regression targets unavailable; skipping regression loss.")
+                            regression_missing_warned = True
+
+            batch_size = y.size(0)
+            total_loss += float(batch_total_loss.item()) * batch_size
+            cls_loss_total += float(cls_loss.item()) * batch_size
+            if reg_loss is not None:
+                reg_loss_total += float(reg_loss.item()) * batch_size
+                regression_samples += batch_size
+            total_samples += batch_size
             meter.update(logits, y)
 
     metrics = meter.compute()
     metrics["loss"] = float(total_loss / max(1, total_samples))
+    metrics["classification_loss"] = float(cls_loss_total / max(1, total_samples))
+    if regression_samples > 0:
+        metrics["regression_loss"] = float(reg_loss_total / max(1, regression_samples))
     return metrics
 
 
@@ -945,6 +1056,41 @@ def main():
     else:
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction=loss_reduction)
 
+    loss_cfg = train_cfg.get("loss", {})
+    classification_weight = float(loss_cfg.get("classification_weight", 1.0))
+    regression_weight = float(loss_cfg.get("regression_weight", 0.0))
+    regression_scale_factor = float(loss_cfg.get("regression_scale_factor", 1.0))
+    regression_loss_type = str(loss_cfg.get("regression_loss", "smooth_l1")).lower()
+    regression_beta = float(loss_cfg.get("regression_beta", 0.1))
+
+    if regression_weight > 0:
+        if regression_loss_type in {"l1", "mae"}:
+            regression_criterion: Optional[nn.Module] = nn.L1Loss(reduction=loss_reduction)
+        elif regression_loss_type in {"mse", "l2"}:
+            regression_criterion = nn.MSELoss(reduction=loss_reduction)
+        else:
+            try:
+                regression_criterion = nn.SmoothL1Loss(beta=regression_beta, reduction=loss_reduction)
+            except TypeError:
+                regression_criterion = nn.SmoothL1Loss(reduction=loss_reduction)
+    else:
+        regression_criterion = None
+
+    hybrid_enabled = bool(getattr(model, "use_hybrid_head", False))
+    regression_dim = getattr(model, "regression_dim", None)
+    bits_per_param = getattr(model, "bits_per_parameter", None)
+    if not hybrid_enabled:
+        regression_weight = 0.0
+        regression_criterion = None
+    if regression_weight > 0 and (regression_dim is None or regression_dim <= 0):
+        print("[WARN] Regression loss enabled but model.regression_dim is not set. Disabling regression component.")
+        regression_weight = 0.0
+        regression_criterion = None
+    if regression_weight > 0 and (bits_per_param is None or bits_per_param <= 0):
+        print("[WARN] Regression loss enabled but model.bits_per_parameter is undefined. Disabling regression component.")
+        regression_weight = 0.0
+        regression_criterion = None
+
     logging_cfg = cfg.get("logging", {})
     workspace_root = Path(cfg.get("workspace_root", "/home/jupyter/work")).expanduser()
     base_out_dir = Path(logging_cfg.get("out_dir", "runs")).expanduser()
@@ -1009,17 +1155,30 @@ def main():
                     state[k] = v.to(device)
         print(f"[INFO] Resumed from {resume_path}. Starting epoch={start_epoch + 1}.")
 
+    regression_targets_available: Optional[bool] = None
+    regression_active = bool(regression_weight > 0 and regression_criterion is not None)
+    missing_regression_output_warned = False
+
     start_time = time.time()
     for epoch in range(start_epoch, epochs):
         epoch_start = time.time()
         model.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_loss = 0.0
+        epoch_cls_loss = 0.0
+        epoch_reg_loss = 0.0
+        epoch_reg_batches = 0
         num_batches = 0
         skipped_steps = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}", ncols=120)
         for step, batch_data in enumerate(pbar):
-            # Handle different batch formats
+            mode_info = None
+            dual_input = None
+            y_a = None
+            y_b = None
+            lam = None
+            use_mixup = False
+
             if use_reference and len(batch_data) == 4:  # (x, y, dual_input, mode_info)
                 x, y, dual_input, mode_info = batch_data
                 x = x.to(device, non_blocking=True)
@@ -1029,65 +1188,103 @@ def main():
                     dual_input = dual_input.to(device, non_blocking=True)
 
                 if channels_last:
-                    # Применяем channels_last только к 4D тензорам [N, C, H, W]
                     if x.dim() == 4:
                         x = x.contiguous(memory_format=torch.channels_last)
                     else:
-                        print(f"[WARN] Unexpected x tensor shape: {x.shape}, expected 4D for channels_last")
+                        print(f'[WARN] Unexpected x tensor shape: {x.shape}, expected 4D for channels_last')
 
                     if dual_input is not None:
                         if dual_input.dim() == 4:
                             dual_input = dual_input.contiguous(memory_format=torch.channels_last)
+                        elif dual_input.dim() == 3:
+                            dual_input = dual_input.unsqueeze(0)
+                            if dual_input.dim() == 4:
+                                dual_input = dual_input.contiguous(memory_format=torch.channels_last)
                         else:
-                            print(f"[WARN] Unexpected dual_input tensor shape: {dual_input.shape}, expected 4D for channels_last")
-                            print(f"[DEBUG] dual_input dtype: {dual_input.dtype}, device: {dual_input.device}")
-                            # Попробуем исправить размерность если возможно
-                            if dual_input.dim() == 3:  # [C, H, W] -> [1, C, H, W]
-                                dual_input = dual_input.unsqueeze(0)
-                                print(f"[DEBUG] Added batch dimension to dual_input: {dual_input.shape}")
-                                if dual_input.dim() == 4:
-                                    dual_input = dual_input.contiguous(memory_format=torch.channels_last)
-                                    print(f"[DEBUG] Successfully applied channels_last to fixed dual_input")
-
-                # No mixup for reference mode
-                with autocast_ctx(device_type, use_amp):
-                    # Model can handle dual input or single input
-                    if dual_input is not None and hasattr(model, 'forward') and 'dual_input' in model.forward.__code__.co_varnames:
-                        logits = model(x, dual_input)
-                    elif dual_input is not None:
-                        # Concatenate dual input if model expects single input
-                        combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
-                        logits = model(combined)
-                    else:
-                        logits = model(x)
-
-                    loss = criterion(logits, y) / grad_accum
+                            print(f'[WARN] Unexpected dual_input tensor shape: {dual_input.shape}, expected 4D for channels_last')
             else:
-                # Standard training
                 x, y, _, _ = batch_data
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
                 if channels_last:
                     x = x.contiguous(memory_format=torch.channels_last)
 
-                # Применяем Mixup с вероятностью mixup_prob
                 use_mixup = mixup_enabled and np.random.rand() < mixup_prob
                 if use_mixup:
                     x, y_a, y_b, lam = mixup_data(x, y, mixup_alpha)
 
-                with autocast_ctx(device_type, use_amp):
-                    logits = model(x)
-                    if use_mixup:
-                        loss = mixup_criterion(criterion, logits, y_a, y_b, lam) / grad_accum
+            with autocast_ctx(device_type, use_amp):
+                if dual_input is not None:
+                    if hasattr(model, 'forward') and 'dual_input' in model.forward.__code__.co_varnames:
+                        outputs = model(x, dual_input)
                     else:
-                        loss = criterion(logits, y) / grad_accum
+                        combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
+                        outputs = model(combined)
+                else:
+                    outputs = model(x)
+
+                logits, reg_out = _unpack_model_output(outputs)
+                if use_mixup and y_a is not None and y_b is not None and lam is not None:
+                    cls_loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
+                else:
+                    cls_loss = criterion(logits, y)
+
+                total_loss = classification_weight * cls_loss
+                reg_loss = None
+
+                if regression_active:
+                    if reg_out is None:
+                        if hybrid_enabled and not missing_regression_output_warned:
+                            print('[WARN] Regression loss configured but model did not return regression outputs. Skipping regression component.')
+                            missing_regression_output_warned = True
+                    else:
+                        if use_mixup and y_a is not None and y_b is not None and lam is not None:
+                            target_a = _build_regression_targets(
+                                y_a,
+                                regression_dim=regression_dim,
+                                bits_per_param=bits_per_param,
+                                scale_factor=regression_scale_factor,
+                            )
+                            target_b = _build_regression_targets(
+                                y_b,
+                                regression_dim=regression_dim,
+                                bits_per_param=bits_per_param,
+                                scale_factor=regression_scale_factor,
+                            )
+                            if target_a is not None and target_b is not None:
+                                regression_targets_available = True
+                                target_a = target_a.to(reg_out.device, dtype=reg_out.dtype)
+                                target_b = target_b.to(reg_out.device, dtype=reg_out.dtype)
+                                reg_loss = lam * regression_criterion(reg_out, target_a) + (1 - lam) * regression_criterion(reg_out, target_b)
+                                total_loss = total_loss + regression_weight * reg_loss
+                            elif regression_targets_available is not False:
+                                print('[WARN] Unable to derive regression targets during mixup; regression loss will be skipped.')
+                                regression_targets_available = False
+                        else:
+                            reg_target = _build_regression_targets(
+                                y,
+                                regression_dim=regression_dim,
+                                bits_per_param=bits_per_param,
+                                scale_factor=regression_scale_factor,
+                                mode_info=mode_info,
+                            )
+                            if reg_target is not None:
+                                regression_targets_available = True
+                                reg_target = reg_target.to(reg_out.device, dtype=reg_out.dtype)
+                                reg_loss = regression_criterion(reg_out, reg_target)
+                                total_loss = total_loss + regression_weight * reg_loss
+                            elif regression_targets_available is not False:
+                                print('[WARN] Regression targets unavailable; skipping regression loss for this batch.')
+                                regression_targets_available = False
+
+                loss = total_loss / grad_accum
             scaler.scale(loss).backward()
             if (step + 1) % grad_accum == 0:
                 if max_grad_norm > 0:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     if not math.isfinite(float(grad_norm)):
-                        print(f"[WARN] Non-finite gradient norm {grad_norm:.4f}. Skipping optimizer step.")
+                        print(f'[WARN] Non-finite gradient norm {grad_norm:.4f}. Skipping optimizer step.')
                         skipped_steps += 1
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
@@ -1096,12 +1293,16 @@ def main():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 ema.update(model)
-            epoch_loss += float(loss.item()) * grad_accum
+            epoch_loss += float(total_loss.detach().item())
+            epoch_cls_loss += float(cls_loss.detach().item())
+            if reg_loss is not None:
+                epoch_reg_loss += float(reg_loss.detach().item())
+                epoch_reg_batches += 1
             num_batches += 1
             global_step += 1
             if writer and log_every > 0 and global_step % log_every == 0:
-                writer.add_scalar("train/loss_iter", epoch_loss / num_batches, global_step)
-            pbar.set_postfix({"loss": f"{epoch_loss / max(1, num_batches):.4f}"})
+                writer.add_scalar('train/loss_iter', epoch_loss / num_batches, global_step)
+            pbar.set_postfix({'loss': f'{epoch_loss / max(1, num_batches):.4f}'})
         
         train_loss = epoch_loss / max(1, num_batches)
         if skipped_steps > 0:
@@ -1110,11 +1311,31 @@ def main():
         if writer:
             writer.add_scalar("train/loss_epoch", train_loss, epoch + 1)
             writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch + 1)
+            writer.add_scalar("train/classification_loss", epoch_cls_loss / max(1, num_batches), epoch + 1)
+            if epoch_reg_batches > 0:
+                writer.add_scalar("train/regression_loss", epoch_reg_loss / max(1, epoch_reg_batches), epoch + 1)
             if skipped_steps > 0:
                 writer.add_scalar("train/skipped_steps", skipped_steps, epoch + 1)
 
         with ema.average_parameters(model):
-            val_metrics = evaluate(model, val_loader, criterion, device, device_type, use_amp, threshold, channels_last, use_reference=use_reference)
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                device_type,
+                use_amp,
+                threshold,
+                channels_last,
+                use_reference=use_reference,
+                classification_weight=classification_weight,
+                regression_criterion=regression_criterion,
+                regression_weight=regression_weight,
+                bits_per_param=bits_per_param,
+                regression_dim=regression_dim,
+                regression_scale_factor=regression_scale_factor,
+                warn_if_missing=regression_active,
+            )
 
         print(f"[INFO] Epoch {epoch + 1}: train_loss={train_loss:.4f} | Val {_format_metrics(val_metrics)}")
         if writer and val_metrics:
@@ -1187,11 +1408,43 @@ def main():
             ema.load_state_dict(ckpt["ema"])
             ema.copy_to(model)
         with torch.no_grad():
-            final_val = evaluate(model, val_loader, criterion, device, device_type, use_amp, threshold, channels_last, use_reference=use_reference)
+            final_val = evaluate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                device_type,
+                use_amp,
+                threshold,
+                channels_last,
+                use_reference=use_reference,
+                classification_weight=classification_weight,
+                regression_criterion=regression_criterion,
+                regression_weight=regression_weight,
+                bits_per_param=bits_per_param,
+                regression_dim=regression_dim,
+                regression_scale_factor=regression_scale_factor,
+            )
             final_metrics["val_best"] = final_val
             print(f"[RESULT] Best validation metrics: {_format_metrics(final_val)}")
             if test_loader is not None:
-                final_test = evaluate(model, test_loader, criterion, device, device_type, use_amp, threshold, channels_last, use_reference=use_reference)
+                final_test = evaluate(
+                    model,
+                    test_loader,
+                    criterion,
+                    device,
+                    device_type,
+                    use_amp,
+                    threshold,
+                    channels_last,
+                    use_reference=use_reference,
+                    classification_weight=classification_weight,
+                    regression_criterion=regression_criterion,
+                    regression_weight=regression_weight,
+                    bits_per_param=bits_per_param,
+                    regression_dim=regression_dim,
+                    regression_scale_factor=regression_scale_factor,
+                )
                 final_metrics["test"] = final_test
                 print(f"[RESULT] Test metrics: {_format_metrics(final_test)}")
 
