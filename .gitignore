@@ -1,0 +1,41 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments & package managers
+.venv/
+env/
+venv/
+pip-wheel-metadata/
+
+# IDE / editor artifacts
+.idea/
+.vscode/
+*.iml
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Checkpoints, logs, and training outputs
+runs/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.log
+
+# Datasets and large artifacts (adjust paths as needed)
+datasets/
+data/
+*.npz
+*.npy
+
+# Jupyter and notebook checkpoints
+.ipynb_checkpoints/
+
+# OS metadata
+.DS_Store
+Thumbs.db
