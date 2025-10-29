@@ -966,6 +966,10 @@ def main():
         )
 
     model_cfg = cfg.get("model", {})
+    use_hybrid_head = bool(model_cfg.get("use_hybrid_head", korsch_mode))
+    reg_dim_cfg = model_cfg.get("regression_dim", 10)
+    regression_dim = int(reg_dim_cfg) if (use_hybrid_head and reg_dim_cfg is not None) else None
+
     model = InterferoNetMultiLabel(
         out_dim=K,
         base_channels=int(model_cfg.get("base_channels", 32)),
@@ -980,8 +984,8 @@ def main():
         head_norm=model_cfg.get("head_norm", "layernorm"),
         # Korsch and reference support
         bits_per_parameter=bits_per_number,
-        use_hybrid_head=bool(model_cfg.get("use_hybrid_head", korsch_mode)),
-        regression_dim=int(model_cfg.get("regression_dim", 10)) if korsch_mode else None,
+        use_hybrid_head=use_hybrid_head,
+        regression_dim=regression_dim,
         use_reference_input=use_reference,
     )
     if channels_last:
