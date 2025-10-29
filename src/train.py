@@ -8,7 +8,7 @@ import hashlib
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -549,6 +549,7 @@ def evaluate(
     threshold: float,
     channels_last: bool,
     *,
+    forward_fn: Optional[Callable[[torch.Tensor, Optional[torch.Tensor]], Any]] = None,
     use_reference: bool = False,
     classification_weight: float = 1.0,
     regression_criterion: Optional[nn.Module] = None,
@@ -570,6 +571,13 @@ def evaluate(
     regression_missing_warned = False
     num_classes = getattr(loader.dataset, "K", 80)
     meter = MultilabelMetrics(num_classes=num_classes, threshold=threshold, device=device)
+
+    if forward_fn is None:
+        def _default_forward(primary: torch.Tensor, secondary: Optional[torch.Tensor] = None):
+            if secondary is not None:
+                return model(primary, secondary)
+            return model(primary)
+        forward_fn = _default_forward
 
     with torch.no_grad():
         for batch_data in loader:
@@ -604,13 +612,13 @@ def evaluate(
 
             with autocast_ctx(device_type, use_amp):
                 if dual_input is not None:
-                    if hasattr(model, "forward") and "dual_input" in model.forward.__code__.co_varnames:
-                        outputs = model(x, dual_input)
-                    else:
+                    if hasattr(model, "forward") and "dual_input" not in model.forward.__code__.co_varnames:
                         combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
-                        outputs = model(combined)
+                        outputs = forward_fn(combined)
+                    else:
+                        outputs = forward_fn(x, dual_input)
                 else:
-                    outputs = model(x)
+                    outputs = forward_fn(x)
 
                 logits, reg_out = _unpack_model_output(outputs)
                 cls_loss = criterion(logits, y)
@@ -988,14 +996,18 @@ def main():
         regression_dim=regression_dim,
         use_reference_input=use_reference,
     )
+    eager_model = model
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     model = model.to(device)
-    if torch_compile:
+    torch_compile_active = bool(torch_compile)
+    if torch_compile_active:
         try:
             model = torch.compile(model, mode="reduce-overhead")
         except Exception as exc:  # pragma: no cover
             print(f"[WARN] torch.compile failed, continuing without compilation: {exc}")
+            torch_compile_active = False
+            model = eager_model
 
     # Use train_cfg already defined above with error handling
     optimizer = torch.optim.AdamW(
@@ -1031,6 +1043,45 @@ def main():
         )
     scaler = make_scaler(device_type, use_amp)
     ema = EMA(model, decay=float(train_cfg.get("ema_decay", 0.999)))
+
+    compile_fallback_triggered = False
+    try:
+        from torch._inductor.exc import InductorError as _TorchInductorError  # type: ignore
+    except Exception:  # pragma: no cover
+        class _TorchInductorError(RuntimeError):
+            pass
+
+    def forward_with_fallback(primary: torch.Tensor, secondary: Optional[torch.Tensor] = None):
+        nonlocal model, torch_compile_active, compile_fallback_triggered, optimizer
+        try:
+            if secondary is not None:
+                return model(primary, secondary)
+            return model(primary)
+        except Exception as exc:
+            message = str(exc).lower()
+            if (
+                torch_compile_active
+                and not compile_fallback_triggered
+                and (
+                    isinstance(exc, _TorchInductorError)
+                    or "inductor" in message
+                    or "compile" in message
+                )
+            ):
+                print("[WARN] TorchInductor execution failed; falling back to eager model.")
+                compile_fallback_triggered = True
+                torch_compile_active = False
+                try:
+                    import torch._dynamo as _dynamo_mod  # type: ignore
+                    _dynamo_mod.reset()
+                except Exception:
+                    pass
+                model = eager_model
+                model = model.to(device)
+                if secondary is not None:
+                    return model(primary, secondary)
+                return model(primary)
+            raise
 
     pos_weight_tensor = None
     bce_pos_value = train_cfg.get("bce_pos_weight", "auto")
@@ -1219,13 +1270,13 @@ def main():
 
             with autocast_ctx(device_type, use_amp):
                 if dual_input is not None:
-                    if hasattr(model, 'forward') and 'dual_input' in model.forward.__code__.co_varnames:
-                        outputs = model(x, dual_input)
-                    else:
+                    if hasattr(model, 'forward') and 'dual_input' not in model.forward.__code__.co_varnames:
                         combined = torch.cat([x, dual_input], dim=1) if dual_input.shape[1] == 1 else dual_input
-                        outputs = model(combined)
+                        outputs = forward_with_fallback(combined)
+                    else:
+                        outputs = forward_with_fallback(x, dual_input)
                 else:
-                    outputs = model(x)
+                    outputs = forward_with_fallback(x)
 
                 logits, reg_out = _unpack_model_output(outputs)
                 if use_mixup and y_a is not None and y_b is not None and lam is not None:
@@ -1331,6 +1382,7 @@ def main():
                 use_amp,
                 threshold,
                 channels_last,
+                forward_fn=forward_with_fallback,
                 use_reference=use_reference,
                 classification_weight=classification_weight,
                 regression_criterion=regression_criterion,
@@ -1421,6 +1473,7 @@ def main():
                 use_amp,
                 threshold,
                 channels_last,
+                forward_fn=forward_with_fallback,
                 use_reference=use_reference,
                 classification_weight=classification_weight,
                 regression_criterion=regression_criterion,
@@ -1441,6 +1494,7 @@ def main():
                     use_amp,
                     threshold,
                     channels_last,
+                    forward_fn=forward_with_fallback,
                     use_reference=use_reference,
                     classification_weight=classification_weight,
                     regression_criterion=regression_criterion,
