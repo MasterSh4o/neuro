@@ -25,13 +25,13 @@ model:
   hidden_dims: [3072, 1536, 768]
 
 data:
-  root: "../../datasets/dual_input_interferograms"
+  root: "../../datasets/InterfDataset"
   img_glob: "**/*.png,**/*.jpg,**/*.tif,**/*.bmp"
-  image_size: 512
+  image_size: 256
 
   reference_interferogram:
     enabled: true
-    path: "../../datasets/dual_input_interferograms/reference/ideal.bmp"
+    path: "/home/jupyter/datasphere/project/neuro/ideal.bmp"
     mode: "dual"
     preprocessing:
       normalize_difference: true
