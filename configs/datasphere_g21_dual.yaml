@@ -41,7 +41,7 @@ data:
 
   resolution_enhancement:
     enabled: true
-    target_resolution: 1024
+    target_resolution: 512
     preserve_fringes: true
     analysis_threshold: 0.8
     upscaling_method: "adaptive"
@@ -53,10 +53,10 @@ data:
     value_mode: "mod"
 
   loader:
-    workers: 12                   # limit to avoid worker OOM on large batches
-    persistent_workers: false
-    prefetch_factor: 4
-    pin_memory: true
+    workers: 8                    # keep worker count modest to avoid OOM
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: false
     drop_last: true
     shuffle: true
 
@@ -71,7 +71,7 @@ split:
 
 train:
   epochs: 160
-  batch_size: 768                 # empirically safe for A100 80GB with dual input
+  batch_size: 512                 # lighter per-worker memory footprint
   grad_accum_steps: 2
   lr: 0.00018
   weight_decay: 0.008
@@ -102,7 +102,7 @@ train:
 
 eval:
   threshold: 0.45
-  batch_size: 384
+  batch_size: 256
   metrics_output: "runs/metrics_g21_dual"
 
 logging:
